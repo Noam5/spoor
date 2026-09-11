@@ -29,7 +29,8 @@ cat > "$ROOT/DEBIAN/control" <<EOF
 Package: spoor
 Version: $VERSION
 Architecture: $ARCH
-Maintainer: spoor maintainers <noreply@invalid>
+Maintainer: Noam <noam555@gmail.com>
+Homepage: https://github.com/Noam5/spoor
 Installed-Size: $(du -sk "$ROOT" | cut -f1)
 Depends: $DEPS, systemd
 Section: utils

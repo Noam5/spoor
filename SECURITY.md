@@ -6,8 +6,10 @@ matters more than most file-search tools'.
 
 ## Reporting a vulnerability
 
-Please report privately through GitHub's **Report a vulnerability** button
-on this repository's Security tab rather than in a public issue. Include the
+Please report privately, not in a public issue: through GitHub's **Report a
+vulnerability** button on the
+[repository's Security tab](https://github.com/Noam5/spoor/security), or by
+email to Noam <noam555@gmail.com>. Include the
 version (`spoor` prints it in the GUI's About box, or see the package
 version), the kernel version and filesystem, and steps to reproduce.
 
