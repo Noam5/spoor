@@ -10,6 +10,8 @@
 //!    overflow ever is reported, we say so loudly rather than going quietly
 //!    stale.
 
+mod catalog;
+mod config;
 mod gui;
 mod index;
 mod ipc;
@@ -19,9 +21,10 @@ mod query;
 mod scan;
 mod watch;
 
+use catalog::{Catalog, Exclude, Part};
 use index::{Index, Kind, SearchOpts};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 const DEFAULT_SOCK: &str = "/run/spoor.sock";
@@ -33,34 +36,102 @@ fn main() {
 
     match cmd {
         "daemon" => {
-            let root = arg_value(&args, "--root").unwrap_or_else(|| "/home".to_string());
-            let sock = arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string());
-            let duration: u64 = arg_value(&args, "--duration")
-                .and_then(|d| d.parse().ok())
-                .unwrap_or(0);
-            let watch_enabled = !args.iter().any(|a| a == "--no-watch");
-            let state = arg_value(&args, "--state").unwrap_or_else(|| DEFAULT_STATE.to_string());
-            let save_interval: u64 = arg_value(&args, "--save-interval")
-                .and_then(|d| d.parse().ok())
-                .unwrap_or(60);
-            let rescan = arg_values(&args, "--rescan");
-            let rescan_interval: u64 = arg_value(&args, "--rescan-interval")
-                .and_then(|d| d.parse().ok())
-                .unwrap_or(900);
-            let reconcile_interval: u64 = arg_value(&args, "--reconcile-interval")
-                .and_then(|d| d.parse().ok())
-                .unwrap_or(86_400);
-            daemon(
-                &root,
-                &sock,
-                duration,
-                watch_enabled,
-                &state,
-                save_interval,
-                rescan,
-                rescan_interval,
-                reconcile_interval,
-            );
+            // The settings file first (the service passes --config); flags
+            // add to it, for tests and one-off runs.
+            let mut cfg = match arg_value(&args, "--config") {
+                Some(p) => match config::Config::load(&p) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => config::Config::default(),
+                    Err(e) => {
+                        eprintln!("spoor: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                None => config::Config {
+                    roots: Vec::new(),
+                    ..config::Config::default()
+                },
+            };
+            cfg.roots.extend(arg_values(&args, "--root"));
+            cfg.exclude.extend(arg_values(&args, "--exclude"));
+            cfg.rescan.extend(arg_values(&args, "--rescan"));
+            if let Some(v) = arg_value(&args, "--rescan-interval").and_then(|d| d.parse().ok()) {
+                cfg.rescan_interval = v;
+            }
+            if cfg.roots.is_empty() {
+                cfg.roots.push("/home".to_string());
+            }
+            for note in cfg.normalize() {
+                eprintln!("spoor: settings: {}", note);
+            }
+            // A folder on a disk that is not plugged in must not keep the
+            // rest from being searchable.
+            cfg.roots.retain(|r| {
+                let ok = std::path::Path::new(r).is_dir();
+                if !ok {
+                    eprintln!(
+                        "spoor: {} is not available; not indexing it until restart",
+                        r
+                    );
+                }
+                ok
+            });
+            if cfg.roots.is_empty() {
+                eprintln!("spoor: none of the folders to index is available");
+                std::process::exit(1);
+            }
+            daemon(DaemonOpts {
+                sock: arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string()),
+                duration_secs: arg_value(&args, "--duration")
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(0),
+                watch_enabled: !args.iter().any(|a| a == "--no-watch"),
+                state_path: arg_value(&args, "--state")
+                    .unwrap_or_else(|| DEFAULT_STATE.to_string()),
+                save_interval: arg_value(&args, "--save-interval")
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(60),
+                reconcile_interval: arg_value(&args, "--reconcile-interval")
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(86_400),
+                config: cfg,
+            });
+        }
+        "configure" => {
+            // Run as root through pkexec by the window's Preferences: validate
+            // the settings, install them, and restart the daemon to apply them.
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("spoor: configure must run as root (the Preferences window uses pkexec)");
+                std::process::exit(1);
+            }
+            let src = positionals(&args)
+                .first()
+                .copied()
+                .unwrap_or("-")
+                .to_string();
+            let dest =
+                arg_value(&args, "--config").unwrap_or_else(|| config::DEFAULT_PATH.to_string());
+            match config::read_input(&src).and_then(|text| config::install(&text, &dest)) {
+                Ok(notes) => {
+                    for n in notes {
+                        println!("note: {}", n);
+                    }
+                    let restarted = std::process::Command::new("systemctl")
+                        .args(["try-restart", "spoor.service"])
+                        .status()
+                        .map(|st| st.success())
+                        .unwrap_or(false);
+                    if restarted {
+                        println!("saved {}; spoor is re-indexing", dest);
+                    } else {
+                        println!("saved {}; restart spoor.service to apply it", dest);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("spoor: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         "query" => {
             let sock = arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string());
@@ -145,7 +216,8 @@ fn main() {
         }
         _ => {
             eprintln!("spoor — privileged file index\n");
-            eprintln!("  spoor daemon [--root /home] [--socket PATH] [--state PATH]");
+            eprintln!("  spoor daemon [--config /etc/spoor/spoor.conf] [--root DIR]... [--exclude DIR]...");
+            eprintln!("                     [--socket PATH] [--state PATH]");
             eprintln!("                     [--save-interval SECS] [--duration SECS] [--no-watch]");
             eprintln!("                     [--rescan PATH]... [--rescan-interval SECS]");
             eprintln!(
@@ -153,6 +225,7 @@ fn main() {
             );
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
             eprintln!("                        [--files|--folders] [--no-hidden] [--null]");
+            eprintln!("  spoor configure [FILE|-]  (root: install index settings and restart)");
             eprintln!("  spoor stats");
             eprintln!("  spoor --version");
             eprintln!("  spoor bench <pattern>… [--opts FLAGS] [--n N]  (server-side timing)");
@@ -165,6 +238,8 @@ fn main() {
 
 /// Flags that consume the following argument; any other "--x" is a switch.
 const VALUE_FLAGS: &[&str] = &[
+    "--config",
+    "--exclude",
     "--socket",
     "--limit",
     "--n",
@@ -210,216 +285,251 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-// One parameter per command-line flag, and one caller: a struct would only
-// rename them.
-#[allow(clippy::too_many_arguments)]
-fn daemon(
-    root: &str,
-    sock: &str,
+/// Daemon settings: /etc/spoor/spoor.conf plus command-line flags.
+struct DaemonOpts {
+    sock: String,
     duration_secs: u64,
     watch_enabled: bool,
-    state_path: &str,
+    state_path: String,
     save_interval: u64,
-    rescan: Vec<String>,
-    rescan_interval: u64,
     reconcile_interval: u64,
-) {
-    if watch_enabled && unsafe { libc::geteuid() } != 0 {
+    config: config::Config,
+}
+
+fn daemon(o: DaemonOpts) {
+    if o.watch_enabled && unsafe { libc::geteuid() } != 0 {
         eprintln!("spoor: must run as root (FAN_MARK_FILESYSTEM needs CAP_SYS_ADMIN)");
         eprintln!("spoor: pass --no-watch to serve a static index unprivileged");
         std::process::exit(1);
     }
-
     install_signal_handlers();
+    let cfg = &o.config;
+    eprintln!("spoor: indexing {}", cfg.roots.join(", "));
+    if !cfg.exclude.is_empty() {
+        eprintln!("spoor: excluding {}", cfg.exclude.join(", "));
+    }
 
     // Watch before walking, so changes during the walk queue up rather than
-    // being lost. FAN_UNLIMITED_QUEUE means the backlog cannot overflow.
-    let mut watcher = if watch_enabled {
-        match watch::Watcher::new(root) {
+    // being lost. FAN_UNLIMITED_QUEUE means the backlog cannot overflow. A
+    // folder that cannot be watched (a filesystem fanotify does not support)
+    // is still indexed, and refreshed by the reconciliation walk.
+    let mut watchers: Vec<Option<watch::Watcher>> = Vec::new();
+    for r in &cfg.roots {
+        if !o.watch_enabled {
+            watchers.push(None);
+            continue;
+        }
+        match watch::Watcher::new(r) {
             Ok(w) => {
-                eprintln!("spoor: watching {} (1 filesystem-wide mark)", root);
-                Some(w)
+                eprintln!("spoor: watching {} (1 filesystem-wide mark)", r);
+                watchers.push(Some(w));
             }
             Err(e) => {
-                eprintln!("spoor: cannot watch {}: {}", root, e);
-                std::process::exit(1);
+                eprintln!(
+                    "spoor: cannot watch {}: {}; only reconciliation will refresh it",
+                    r, e
+                );
+                watchers.push(None);
             }
         }
-    } else {
+    }
+    if !o.watch_enabled {
         eprintln!("spoor: --no-watch, index will be static");
-        None
-    };
+    }
 
-    // Serve the previous snapshot immediately, so queries work during the
-    // reconciliation scan instead of failing for the first 20 seconds.
-    let index = match persist::load(state_path) {
-        Ok(ix) => {
+    // Serve the previous snapshot immediately, so queries work during the walk
+    // instead of failing for the first 20 seconds. Folders no longer
+    // configured are dropped; new ones start empty.
+    let mut previous: HashMap<String, Index> = match persist::load(&o.state_path) {
+        Ok(parts) => {
+            let n: usize = parts.iter().map(|(_, ix)| ix.len()).sum();
             eprintln!(
                 "spoor: loaded snapshot {} ({} entries), serving while rescanning",
-                state_path,
-                ix.len()
+                o.state_path, n
             );
-            Arc::new(RwLock::new(ix))
+            parts.into_iter().collect()
         }
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
                 eprintln!("spoor: snapshot unusable ({}), starting empty", e);
             }
-            Arc::new(RwLock::new(Index::new()))
+            HashMap::new()
         }
     };
+    let parts = cfg
+        .roots
+        .iter()
+        .map(|r| (r.clone(), previous.remove(r).unwrap_or_else(Index::new)))
+        .collect();
+    let cat = Arc::new(Catalog::new(parts, &cfg.exclude));
 
-    let ipc_index = Arc::clone(&index);
-    let sock_owned = sock.to_string();
+    let ipc_cat = Arc::clone(&cat);
+    let sock_owned = o.sock.clone();
     std::thread::spawn(move || {
-        if let Err(e) = ipc::serve(&sock_owned, ipc_index) {
+        if let Err(e) = ipc::serve(&sock_owned, ipc_cat) {
             eprintln!("spoor: ipc failed: {}", e);
         }
     });
-    eprintln!("spoor: listening on {}", sock);
+    eprintln!("spoor: listening on {}", o.sock);
 
-    // Reconciliation scan. ext4 has no change journal, so a restart cannot know
-    // what changed while we were down; only a full walk can establish truth.
-    let t0 = Instant::now();
-    let mut fresh = Index::new();
-    let stats = scan::scan(&mut fresh, root);
-    eprintln!(
-        "spoor: indexed {} files + {} dirs in {:.1}s ({} unreadable)",
-        stats.files,
-        stats.dirs,
-        t0.elapsed().as_secs_f64(),
-        stats.errors
-    );
-    let t1 = Instant::now();
-    fresh.build_trigrams();
-    let (distinct, postings) = fresh.trigram_stats();
-    eprintln!(
-        "spoor: trigram index built in {:.1}s ({} distinct, {} postings)",
-        t1.elapsed().as_secs_f64(),
-        distinct,
-        postings
-    );
-    *index.write().unwrap() = fresh;
-    // Last successful listing of each rescanned mount, so a reconciliation can
-    // graft it into the fresh index instead of waiting for the next rescan.
-    let listings: Listings = Arc::new(Mutex::new(HashMap::new()));
+    // A full walk of every folder. ext4 has no change journal, so a restart
+    // cannot know what changed while we were down; only a walk establishes
+    // truth. Each folder is swapped in as soon as its own walk is done.
+    for p in &cat.parts {
+        let (fresh, st, took) = walk_part(p, &cat.exclude);
+        let (distinct, postings) = fresh.trigram_stats();
+        eprintln!(
+            "spoor: indexed {}: {} files + {} dirs in {:.1}s ({} unreadable; {} trigrams, {} postings)",
+            p.root,
+            st.files,
+            st.dirs,
+            took.as_secs_f64(),
+            st.errors,
+            distinct,
+            postings
+        );
+        *p.index.write().unwrap() = fresh;
+    }
 
     // Mounts fanotify cannot watch are walked on a timer instead. Started only
     // now, after the swap, so the first graft lands in the live index rather
     // than in the snapshot being replaced.
-    if !rescan.is_empty() {
+    if !cfg.rescan.is_empty() {
         eprintln!(
             "spoor: will rescan {} every {}s",
-            rescan.join(", "),
-            rescan_interval
+            cfg.rescan.join(", "),
+            cfg.rescan_interval
         );
-        let rescan_index = Arc::clone(&index);
-        let rescan_listings = Arc::clone(&listings);
-        std::thread::spawn(move || {
-            rescan_loop(rescan_index, rescan, rescan_interval, rescan_listings)
-        });
+        let (c, paths, every) = (Arc::clone(&cat), cfg.rescan.clone(), cfg.rescan_interval);
+        std::thread::spawn(move || rescan_loop(c, paths, every));
     }
-    if reconcile_interval > 0 {
-        let rec_index = Arc::clone(&index);
-        let rec_root = root.to_string();
-        let rec_listings = Arc::clone(&listings);
-        std::thread::spawn(move || {
-            reconcile_loop(rec_index, rec_root, reconcile_interval, rec_listings)
-        });
+    if o.reconcile_interval > 0 {
+        let (c, every) = (Arc::clone(&cat), o.reconcile_interval);
+        std::thread::spawn(move || reconcile_loop(c, every));
     }
-
     // Periodic snapshot, so a kill costs at most one interval.
-    if save_interval > 0 {
-        let save_index = Arc::clone(&index);
-        let sp = state_path.to_string();
+    if o.save_interval > 0 {
+        let (c, sp, every) = (Arc::clone(&cat), o.state_path.clone(), o.save_interval);
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(save_interval));
-            if SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(every));
+            if stopping() {
                 return;
             }
-            let ix = save_index.read().unwrap();
-            match persist::save(&ix, &sp) {
+            match save_snapshot(&c, &sp) {
                 Ok(n) => eprintln!("spoor: snapshot saved ({} slots)", n),
                 Err(e) => eprintln!("spoor: snapshot failed: {}", e),
             }
         });
     }
+    for (i, w) in watchers.into_iter().enumerate() {
+        if let Some(w) = w {
+            let c = Arc::clone(&cat);
+            std::thread::spawn(move || watch_loop(c, i, w));
+        }
+    }
 
-    let deadline = if duration_secs > 0 {
-        Some(Instant::now() + std::time::Duration::from_secs(duration_secs))
-    } else {
-        None
-    };
+    let deadline = (o.duration_secs > 0)
+        .then(|| Instant::now() + std::time::Duration::from_secs(o.duration_secs));
     eprintln!("spoor: ready");
-
     loop {
-        if SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("spoor: signal received, shutting down");
+        if stopping() {
+            if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("spoor: stopping after a watch error");
+            } else {
+                eprintln!("spoor: signal received, shutting down");
+            }
             break;
         }
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                eprintln!("spoor: duration elapsed, exiting");
-                break;
-            }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            eprintln!("spoor: duration elapsed, exiting");
+            break;
         }
-        match watcher.as_mut() {
-            Some(w) => {
-                if !w.wait(300) {
-                    continue;
-                }
-                match w.read_events() {
-                    Ok(events) => {
-                        if events.is_empty() {
-                            continue;
-                        }
-                        let mut ix = index.write().unwrap();
-                        // Under the write lock, so a reconciliation swapping
-                        // the index sees each batch either captured or not yet
-                        // read -- never half of it.
-                        if let Some(buf) = CAPTURE.lock().unwrap().as_mut() {
-                            buf.extend(events.iter().cloned());
-                        }
-                        for ev in &events {
-                            apply(&mut ix, ev);
-                        }
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        eprintln!("spoor: read error: {}", e);
-                        break;
-                    }
-                }
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(200)),
-        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // Final save on the way out, in addition to (not instead of) the periodic one.
-    let ix = index.read().unwrap();
-    match persist::save(&ix, state_path) {
+    match save_snapshot(&cat, &o.state_path) {
         Ok(n) => eprintln!("spoor: final snapshot saved ({} slots)", n),
         Err(e) => eprintln!("spoor: final snapshot failed: {}", e),
     }
-    let _ = std::fs::remove_file(sock);
+    let _ = std::fs::remove_file(&o.sock);
+    // A failure exit, so systemd's Restart=on-failure brings the watch back.
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::exit(1);
+    }
 }
 
-type Listings = Arc<Mutex<HashMap<String, Vec<(u32, Vec<u8>, bool)>>>>;
+fn stopping() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-/// Events applied while a reconciliation walk runs, kept for replay onto the
-/// fresh index. Pushed and taken only under the index write lock, so every
-/// event is either replayed or applied after the swap: never lost, never twice.
-static CAPTURE: Mutex<Option<Vec<watch::Event>>> = Mutex::new(None);
+/// Every part, each under its own read lock for the length of the write.
+fn save_snapshot(cat: &Catalog, path: &str) -> std::io::Result<usize> {
+    let guards: Vec<_> = cat.parts.iter().map(|p| p.index.read().unwrap()).collect();
+    let parts: Vec<(&str, &Index)> = cat
+        .parts
+        .iter()
+        .zip(&guards)
+        .map(|(p, g)| (p.root.as_str(), &**g))
+        .collect();
+    persist::save(&parts, path)
+}
 
-/// Rebuild the index from a fresh walk on a timer. This compacts the arena
-/// (dead entries otherwise accumulate for as long as the daemon runs) and
-/// corrects drift from any event that could not be applied. Changes made
-/// during the walk are captured and replayed before the new index is swapped
-/// in. Memory peaks at two indexes for the length of the walk.
-fn reconcile_loop(index: Arc<RwLock<Index>>, root: String, interval: u64, listings: Listings) {
-    let stopping = || SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed);
+/// A freshly walked index of one folder, with the last complete listing of
+/// each rescanned mount inside it grafted in: ready to swap in.
+fn walk_part(p: &Part, exclude: &Exclude) -> (Index, scan::ScanStats, std::time::Duration) {
+    let t0 = Instant::now();
+    let mut fresh = Index::new();
+    let st = scan::scan(&mut fresh, &p.root, exclude);
+    for (path, list) in p.listings.lock().unwrap().iter() {
+        if let Some(mount) = fresh.resolve_path(path) {
+            fresh.graft(mount, list);
+        }
+    }
+    fresh.build_trigrams();
+    (fresh, st, t0.elapsed())
+}
+
+/// Applies one folder's fanotify events to its index. Every folder has its own
+/// mark and thread, so a busy filesystem never delays another's updates.
+fn watch_loop(cat: Arc<Catalog>, i: usize, mut w: watch::Watcher) {
+    let part = &cat.parts[i];
+    while !stopping() {
+        if !w.wait(300) {
+            continue;
+        }
+        match w.read_events() {
+            Ok(events) => {
+                if events.is_empty() {
+                    continue;
+                }
+                let mut ix = part.index.write().unwrap();
+                // Under the write lock, so a reconciliation swapping the index
+                // sees each batch either captured or not yet read -- never half.
+                if let Some(buf) = part.capture.lock().unwrap().as_mut() {
+                    buf.extend(events.iter().cloned());
+                }
+                for ev in &events {
+                    apply(&mut ix, ev, &cat.exclude);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                eprintln!("spoor: {}: read error: {}", part.root, e);
+                FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+/// Rebuilds every folder's index from a fresh walk on a timer, one folder at a
+/// time. This compacts the arena (dead entries otherwise accumulate for as long
+/// as the daemon runs) and corrects drift from any event that could not be
+/// applied. Changes made during a walk are captured and replayed before the new
+/// index is swapped in. Memory peaks at one extra index for the length of a walk.
+fn reconcile_loop(cat: Arc<Catalog>, interval: u64) {
     loop {
         for _ in 0..interval {
             if stopping() {
@@ -427,36 +537,34 @@ fn reconcile_loop(index: Arc<RwLock<Index>>, root: String, interval: u64, listin
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        let t0 = Instant::now();
-        *CAPTURE.lock().unwrap() = Some(Vec::new());
-        let mut fresh = Index::new();
-        let st = scan::scan(&mut fresh, &root);
-        for (path, list) in listings.lock().unwrap().iter() {
-            if let Some(mount) = fresh.resolve_path(path) {
-                fresh.graft(mount, list);
+        for p in &cat.parts {
+            if stopping() {
+                return;
             }
+            *p.capture.lock().unwrap() = Some(Vec::new());
+            let (mut fresh, st, took) = walk_part(p, &cat.exclude);
+            let (before, after, replayed) = {
+                let mut ix = p.index.write().unwrap();
+                let events = p.capture.lock().unwrap().take().unwrap_or_default();
+                for ev in &events {
+                    apply(&mut fresh, ev, &cat.exclude);
+                }
+                let before = ix.capacity_used();
+                let after = fresh.capacity_used();
+                *ix = fresh;
+                (before, after, events.len())
+            };
+            eprintln!(
+                "spoor: reconciled {} in {:.1}s: {} files + {} dirs, arena {} -> {} slots, {} events replayed",
+                p.root,
+                took.as_secs_f64(),
+                st.files,
+                st.dirs,
+                before,
+                after,
+                replayed
+            );
         }
-        fresh.build_trigrams();
-        let (before, after, replayed) = {
-            let mut ix = index.write().unwrap();
-            let events = CAPTURE.lock().unwrap().take().unwrap_or_default();
-            for ev in &events {
-                apply(&mut fresh, ev);
-            }
-            let before = ix.capacity_used();
-            let after = fresh.capacity_used();
-            *ix = fresh;
-            (before, after, events.len())
-        };
-        eprintln!(
-            "spoor: reconciled in {:.1}s: {} files + {} dirs, arena {} -> {} slots, {} events replayed",
-            t0.elapsed().as_secs_f64(),
-            st.files,
-            st.dirs,
-            before,
-            after,
-            replayed
-        );
     }
 }
 
@@ -464,9 +572,8 @@ fn reconcile_loop(index: Arc<RwLock<Index>>, root: String, interval: u64, listin
 /// is not available yet (rclone has not mounted it, or it refuses root) is
 /// retried every minute instead of waiting out the whole interval -- at boot,
 /// spoor usually starts before the network mount does.
-fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, listings: Listings) {
+fn rescan_loop(cat: Arc<Catalog>, paths: Vec<String>, interval: u64) {
     const RETRY: u64 = 60;
-    let stopping = || SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed);
     loop {
         let mut all_ok = true;
         for p in &paths {
@@ -474,7 +581,7 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, lis
                 return;
             }
             let t0 = Instant::now();
-            match scan::walk_foreign(p) {
+            match scan::walk_foreign(p, &cat.exclude) {
                 scan::ForeignWalk::Unavailable(why) => {
                     all_ok = false;
                     eprintln!(
@@ -485,16 +592,21 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, lis
                 scan::ForeignWalk::Listed(list, errors) => {
                     let walk_s = t0.elapsed().as_secs_f64();
                     let t1 = Instant::now();
-                    let mut ix = index.write().unwrap();
+                    let Some(part) = cat.part_for(p) else {
+                        all_ok = false;
+                        eprintln!("spoor: rescan {}: not inside an indexed folder", p);
+                        continue;
+                    };
+                    let mut ix = part.index.write().unwrap();
                     match ix.resolve_path(p) {
                         None => {
                             all_ok = false;
-                            eprintln!("spoor: rescan {}: not inside the indexed tree", p);
+                            eprintln!("spoor: rescan {}: not in the index (excluded?)", p);
                         }
                         Some(mount) => {
                             let st = ix.graft(mount, &list);
                             drop(ix);
-                            listings.lock().unwrap().insert(p.clone(), list);
+                            part.listings.lock().unwrap().insert(p.clone(), list);
                             eprintln!(
                                 "spoor: rescanned {}: {} entries (+{} -{}), walked in {:.1}s, merged in {:.0}ms{}",
                                 p,
@@ -528,6 +640,10 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, lis
     }
 }
 
+/// Set by a watch thread that cannot continue, so the daemon exits with a
+/// failure status and systemd restarts it.
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: i32) {
@@ -543,7 +659,7 @@ fn install_signal_handlers() {
 
 static UNRESOLVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn apply(ix: &mut Index, ev: &watch::Event) {
+fn apply(ix: &mut Index, ev: &watch::Event, exclude: &Exclude) {
     if ev.mask & watch::FAN_Q_OVERFLOW != 0 {
         eprintln!("spoor: FAN_Q_OVERFLOW — index may be incomplete, rescan needed");
         return;
@@ -574,13 +690,18 @@ fn apply(ix: &mut Index, ev: &watch::Event) {
         let full = std::path::PathBuf::from(
             <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(full),
         );
+        // Anything inside an excluded folder has no parent in the index and is
+        // dropped above; only the folder itself, created anew, arrives here.
+        if exclude.contains(&full) {
+            return;
+        }
         let ino = std::fs::symlink_metadata(&full)
             .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
             .unwrap_or(0);
 
         let id = ix.add(parent, &ev.name, ev.is_dir(), ino);
         if ev.is_dir() {
-            scan::scan_subtree(ix, id, &full, 0);
+            scan::scan_subtree(ix, id, &full, 0, exclude);
         }
     } else if ev.is_delete() {
         if let Some(id) = ix.find_child(parent, &ev.name) {
@@ -608,7 +729,7 @@ fn selftest(root: &str) {
 
     let t0 = Instant::now();
     let mut ix = Index::new();
-    let st = scan::scan(&mut ix, root);
+    let st = scan::scan(&mut ix, root, &Exclude::new());
     println!(
         "[2] initial walk: {} files + {} dirs in {:.1}s ({} unreadable)",
         st.files,
@@ -635,7 +756,7 @@ fn selftest(root: &str) {
         }
         if let Ok(events) = watcher.read_events() {
             for ev in &events {
-                apply(&mut ix, ev);
+                apply(&mut ix, ev, &Exclude::new());
                 applied += 1;
             }
         }

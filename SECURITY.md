@@ -26,6 +26,12 @@ as they are ready, with credit unless you ask otherwise.
   (`faccessat2` with `AT_EACCESS`). If the switch fails, the query fails; if
   switching back fails, the daemon aborts rather than keep serving with the
   wrong identity.
+* **Only an administrator chooses what is indexed.** The Preferences window
+  runs `spoor configure` through pkexec (polkit action `org.spoor.configure`,
+  administrator authentication). It reads the new settings on stdin and
+  checks every path: absolute, no `..`, symlinks resolved, folders to index
+  must exist. It never echoes its input back, and it writes
+  `/etc/spoor/spoor.conf` atomically.
 * **The snapshot is root-only** (`/var/lib/spoor`, mode 0700, file 0600).
 * **Bounded work per client:** at most 32 connections, 64 KiB requests,
   read and write timeouts, and linear-time regular expressions with a

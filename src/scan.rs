@@ -4,6 +4,7 @@
 //! not require file names to be UTF-8, and a lossily converted name finds the
 //! file but cannot open it.
 
+use crate::catalog::Exclude;
 use crate::index::{Index, NO_PARENT};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -23,8 +24,9 @@ pub struct ScanStats {
 /// `DirEntry::metadata()`: using the latter turns a symlinked directory into an
 /// apparent real one, and the walk loops forever on any symlink cycle.
 /// `DirEntry::ino()` reads d_ino straight from the dirent, so the common path
-/// costs no stat at all.
-pub fn scan(index: &mut Index, root: &str) -> ScanStats {
+/// costs no stat at all. Folders in `exclude` are left out, with everything
+/// beneath them.
+pub fn scan(index: &mut Index, root: &str, exclude: &Exclude) -> ScanStats {
     let mut stats = ScanStats {
         files: 0,
         dirs: 0,
@@ -64,11 +66,19 @@ pub fn scan(index: &mut Index, root: &str) -> ScanStats {
             };
             let name = entry.file_name();
             let is_dir = ft.is_dir(); // symlinks report as symlink, not dir
+            let child_path = if is_dir {
+                let p = parent_path.join(&name);
+                if exclude.contains(&p) {
+                    continue;
+                }
+                Some(p)
+            } else {
+                None
+            };
             let id = index.add_new(parent_id, name.as_bytes(), is_dir, entry.ino());
 
-            if is_dir {
+            if let Some(child_path) = child_path {
                 stats.dirs += 1;
-                let child_path = parent_path.join(&name);
                 // stat only directories, to honour mount boundaries
                 match fs::symlink_metadata(&child_path) {
                     Ok(m) if m.dev() == root_dev => queue.push((id, child_path)),
@@ -85,7 +95,7 @@ pub fn scan(index: &mut Index, root: &str) -> ScanStats {
 
 /// Walk a directory that appeared at runtime, so anything already inside it
 /// (created before we processed the event) is picked up too.
-pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32) {
+pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32, exclude: &Exclude) {
     if depth > 64 {
         return;
     }
@@ -99,9 +109,13 @@ pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32) 
         };
         let name = entry.file_name();
         let is_dir = ft.is_dir();
+        let child = path.join(&name);
+        if is_dir && exclude.contains(&child) {
+            continue;
+        }
         let id = index.add(parent_id, name.as_bytes(), is_dir, entry.ino());
         if is_dir {
-            scan_subtree(index, id, &path.join(&name), depth + 1);
+            scan_subtree(index, id, &child, depth + 1, exclude);
         }
     }
 }
@@ -124,7 +138,7 @@ pub enum ForeignWalk {
 /// that would wipe the index's copy of the drive. Also refuses when the mount
 /// cannot be read at all -- a FUSE mount without allow_other is closed to the
 /// root daemon -- rather than reporting it as empty.
-pub fn walk_foreign(path: &str) -> ForeignWalk {
+pub fn walk_foreign(path: &str, exclude: &Exclude) -> ForeignWalk {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) => return ForeignWalk::Unavailable(e.to_string()),
@@ -184,8 +198,11 @@ pub fn walk_foreign(path: &str) -> ForeignWalk {
             };
             let name = entry.file_name();
             let is_dir = ft.is_dir();
-            let idx = out.len() as u32;
             let child = dir.join(&name);
+            if is_dir && exclude.contains(&child) {
+                continue;
+            }
+            let idx = out.len() as u32;
             out.push((parent_idx, name.as_bytes().to_vec(), is_dir));
             if is_dir {
                 // no nested mounts
@@ -215,7 +232,7 @@ mod tests {
         fs::write(base.join("sub").join("line\nbreak.txt"), b"y").unwrap();
 
         let mut ix = Index::new();
-        let st = scan(&mut ix, base.to_str().unwrap());
+        let st = scan(&mut ix, base.to_str().unwrap(), &Exclude::new());
         assert_eq!(st.errors, 0);
         ix.build_trigrams();
         for q in ["latin1", "break"] {
@@ -228,6 +245,34 @@ mod tests {
                 q
             );
         }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn excluded_folders_are_skipped_with_their_contents() {
+        let base = std::env::temp_dir().join(format!("spoor-excl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("keep")).unwrap();
+        fs::create_dir_all(base.join("skip/deep")).unwrap();
+        fs::write(base.join("keep/a.txt"), b"").unwrap();
+        fs::write(base.join("skip/deep/b.txt"), b"").unwrap();
+        let ex: Exclude = [base.join("skip")].into_iter().collect();
+        let mut ix = Index::new();
+        scan(&mut ix, base.to_str().unwrap(), &ex);
+        assert_eq!(ix.search("a.txt", 10).len(), 1);
+        assert!(ix.search("skip", 10).is_empty());
+        assert!(ix.search("b.txt", 10).is_empty());
+
+        // a folder that appears later, with an excluded folder inside it
+        fs::create_dir_all(base.join("new/skip2")).unwrap();
+        fs::write(base.join("new/skip2/c.txt"), b"").unwrap();
+        fs::write(base.join("new/d.txt"), b"").unwrap();
+        let ex2: Exclude = [base.join("new/skip2")].into_iter().collect();
+        let root = ix.root_id();
+        let id = ix.add(root, "new", true, 0);
+        scan_subtree(&mut ix, id, &base.join("new"), 0, &ex2);
+        assert!(ix.search("c.txt", 10).is_empty());
+        assert_eq!(ix.search("d.txt", 10).len(), 1);
         fs::remove_dir_all(&base).unwrap();
     }
 }

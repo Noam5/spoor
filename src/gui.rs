@@ -11,15 +11,17 @@
 //! be UTF-8, and a GTK string column would mangle it, so the store holds only
 //! display text plus an index into `Ui::paths`.
 
+use crate::config;
 use crate::index::{Kind, SearchOpts};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     AccelFlags, AccelGroup, AppChooserDialog, Application, ApplicationWindow, Box as GtkBox,
-    Button, CellRendererText, CheckButton, CheckMenuItem, Dialog, DialogFlags, Entry, Label,
-    ListStore, Menu, MenuBar, MenuItem, Orientation, PolicyType, RadioMenuItem, ResponseType,
-    ScrolledWindow, SeparatorMenuItem, SpinButton, TreeView, TreeViewColumn,
+    Button, CellRendererText, CheckButton, CheckMenuItem, Dialog, DialogFlags, Entry,
+    FileChooserAction, FileChooserDialog, Label, ListStore, Menu, MenuBar, MenuItem, Orientation,
+    PolicyType, RadioMenuItem, ResponseType, ScrolledWindow, SeparatorMenuItem, SpinButton,
+    TreeView, TreeViewColumn,
 };
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
@@ -909,7 +911,7 @@ fn show_preferences(ui: &Rc<Ui>) {
         DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
         &[("_Close", ResponseType::Close)],
     );
-    dialog.set_default_width(460);
+    dialog.set_default_width(600);
     let s = ui.settings.borrow().clone();
 
     let content = GtkBox::new(Orientation::Vertical, 8);
@@ -969,9 +971,232 @@ fn show_preferences(ui: &Rc<Ui>) {
         });
     }
 
+    // Which folders the daemon indexes. They belong to the machine, not to
+    // this user, so applying goes through pkexec and asks for an administrator.
+    let (cfg, cfg_note) = match config::Config::load(config::DEFAULT_PATH) {
+        Ok(Some(c)) => (c, None),
+        Ok(None) => (config::Config::default(), None),
+        Err(e) => (config::Config::default(), Some(e)),
+    };
+    let apply_status =
+        Label::new(Some(cfg_note.as_deref().unwrap_or(
+            "Applying asks for an administrator password, then re-indexes.",
+        )));
+    apply_status.set_xalign(0.0);
+    apply_status.set_line_wrap(true);
+    let (roots_box, roots) = folder_list(
+        &dialog,
+        &apply_status,
+        "Indexed folders",
+        "kept current live",
+        &cfg.roots,
+    );
+    let (excl_box, exclude) = folder_list(
+        &dialog,
+        &apply_status,
+        "Excluded folders",
+        "left out, with everything inside them",
+        &cfg.exclude,
+    );
+    let (rescan_box, rescan) = folder_list(
+        &dialog,
+        &apply_status,
+        "Network folders",
+        "rclone or network mounts inside an indexed folder, walked on a timer",
+        &cfg.rescan,
+    );
+    let every_row = GtkBox::new(Orientation::Horizontal, 8);
+    let every_label = Label::with_mnemonic("Walk network folders every (_minutes):");
+    let every = SpinButton::with_range(1.0, 10_080.0, 5.0);
+    every.set_value((cfg.rescan_interval / 60).max(1) as f64);
+    every_label.set_mnemonic_widget(Some(&every));
+    every_row.pack_start(&every_label, false, false, 0);
+    every_row.pack_start(&every, false, false, 0);
+    let apply = Button::with_mnemonic("_Apply Folder Changes…");
+    let apply_row = GtkBox::new(Orientation::Horizontal, 8);
+    apply_row.pack_start(&apply_status, true, true, 0);
+    apply_row.pack_end(&apply, false, false, 0);
+    content.pack_start(
+        &gtk::Separator::new(Orientation::Horizontal),
+        false,
+        false,
+        6,
+    );
+    for w in [&roots_box, &excl_box, &rescan_box] {
+        content.pack_start(w, true, true, 0);
+    }
+    content.pack_start(&every_row, false, false, 0);
+    content.pack_start(&apply_row, false, false, 0);
+    {
+        let ui = ui.clone();
+        let st = apply_status.clone();
+        apply.connect_clicked(move |btn| {
+            let c = config::Config {
+                roots: store_paths(&roots),
+                exclude: store_paths(&exclude),
+                rescan: store_paths(&rescan),
+                rescan_interval: every.value_as_int().max(1) as u64 * 60,
+            };
+            // Check here first, so a mistake does not cost a password prompt.
+            if let Err(e) = c.clone().validate() {
+                st.set_text(&e);
+                return;
+            }
+            st.set_text("waiting for authentication…");
+            btn.set_sensitive(false);
+            let text = c.to_text();
+            let (st, btn, ui) = (st.clone(), btn.clone(), ui.clone());
+            glib::MainContext::default().spawn_local(async move {
+                let res = gio::spawn_blocking(move || run_configure(&text)).await;
+                btn.set_sensitive(true);
+                match res.unwrap_or_else(|_| Err("the settings helper failed".into())) {
+                    Ok(msg) => {
+                        st.set_text(&msg);
+                        // The daemon restarts; report on it once it is back.
+                        glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                            show_connection(&ui)
+                        });
+                    }
+                    Err(e) => st.set_text(&e),
+                }
+            });
+        });
+    }
+
     dialog.content_area().pack_start(&content, true, true, 0);
     dialog.connect_response(|d, _| d.close());
     dialog.show_all();
+}
+
+/// An editable list of folders for the Preferences dialog.
+fn folder_list(
+    parent: &Dialog,
+    status: &Label,
+    title: &str,
+    hint: &str,
+    paths: &[String],
+) -> (GtkBox, ListStore) {
+    let store = ListStore::new(&[String::static_type()]);
+    for p in paths {
+        store.insert_with_values(None, &[(0, p)]);
+    }
+    let tree = TreeView::with_model(&store);
+    tree.set_headers_visible(false);
+    let r = CellRendererText::new();
+    r.set_property("ellipsize", gtk::pango::EllipsizeMode::Middle);
+    let c = TreeViewColumn::new();
+    CellLayoutExt::pack_start(&c, &r, true);
+    CellLayoutExt::add_attribute(&c, &r, "text", 0);
+    tree.append_column(&c);
+    let scroll = ScrolledWindow::builder()
+        .min_content_height(64)
+        .hscrollbar_policy(PolicyType::Never)
+        .build();
+    scroll.set_shadow_type(gtk::ShadowType::In);
+    scroll.add(&tree);
+
+    let add = Button::with_label("Add…");
+    let remove = Button::with_label("Remove");
+    {
+        let (store, parent, status) = (store.clone(), parent.clone(), status.clone());
+        let title = title.to_string();
+        add.connect_clicked(move |_| {
+            let chooser = FileChooserDialog::with_buttons(
+                Some(&format!("Add to {}", title)),
+                Some(&parent),
+                FileChooserAction::SelectFolder,
+                &[
+                    ("_Cancel", ResponseType::Cancel),
+                    ("_Add", ResponseType::Accept),
+                ],
+            );
+            chooser.set_modal(true);
+            let (store, status) = (store.clone(), status.clone());
+            chooser.connect_response(move |d, resp| {
+                if resp == ResponseType::Accept {
+                    match d.filename().as_deref().and_then(|p| p.to_str()) {
+                        Some(p) => {
+                            store.insert_with_values(None, &[(0, &p)]);
+                        }
+                        None => status.set_text("folder names must be valid UTF-8"),
+                    }
+                }
+                d.close();
+            });
+            chooser.show_all();
+        });
+    }
+    {
+        let (tree, store) = (tree.clone(), store.clone());
+        remove.connect_clicked(move |_| {
+            if let Some((_, iter)) = tree.selection().selected() {
+                store.remove(&iter);
+            }
+        });
+    }
+    let buttons = GtkBox::new(Orientation::Vertical, 4);
+    buttons.pack_start(&add, false, false, 0);
+    buttons.pack_start(&remove, false, false, 0);
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    row.pack_start(&scroll, true, true, 0);
+    row.pack_start(&buttons, false, false, 0);
+    let label = Label::new(None);
+    label.set_markup(&format!(
+        "<b>{}</b>   <small>{}</small>",
+        glib::markup_escape_text(title),
+        glib::markup_escape_text(hint)
+    ));
+    label.set_xalign(0.0);
+    let v = GtkBox::new(Orientation::Vertical, 4);
+    v.pack_start(&label, false, false, 0);
+    v.pack_start(&row, true, true, 0);
+    (v, store)
+}
+
+fn store_paths(store: &ListStore) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(it) = store.iter_first() {
+        loop {
+            if let Ok(p) = store.value(&it, 0).get::<String>() {
+                out.push(p);
+            }
+            if !store.iter_next(&it) {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Runs `pkexec spoor configure -` with the new settings on its stdin, and
+/// turns the outcome into a sentence for the dialog.
+fn run_configure(text: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Replaced on disk while running (an upgrade): the new file is at the old path.
+    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
+    let mut child = Command::new("pkexec")
+        .arg(&exe)
+        .args(["configure", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run pkexec: {}", e))?;
+    if let Some(mut w) = child.stdin.take() {
+        let _ = w.write_all(text.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match out.status.code() {
+        Some(0) => Ok(stdout),
+        Some(126) => Err("Cancelled; the folders are unchanged.".into()),
+        Some(127) => Err("Not authorized; the folders are unchanged.".into()),
+        _ if stderr.is_empty() => Err("Could not save the folders.".into()),
+        _ => Err(stderr.trim_start_matches("spoor: ").to_string()),
+    }
 }
 
 fn show_syntax(ui: &Ui) {

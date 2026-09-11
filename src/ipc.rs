@@ -19,6 +19,7 @@
 //! SO_PEERGROUPS, recorded by the kernel at connect time), and a path is
 //! returned only if that user could list the directory that contains it.
 
+use crate::catalog::Catalog;
 use crate::index::{Index, SearchOpts};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -26,7 +27,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Upper bound on results per request, whatever the client asks for.
@@ -42,7 +43,7 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 const SO_PEERGROUPS: libc::c_int = 59;
 const SYS_FACCESSAT2: libc::c_long = 439;
 
-pub fn serve(sock_path: &str, index: Arc<RwLock<Index>>) -> io::Result<()> {
+pub fn serve(sock_path: &str, index: Arc<Catalog>) -> io::Result<()> {
     let _ = std::fs::remove_file(sock_path);
     let listener = UnixListener::bind(sock_path)?;
     // A root daemon filters every reply by the caller's permissions, so anyone
@@ -78,7 +79,7 @@ pub fn serve(sock_path: &str, index: Arc<RwLock<Index>>) -> io::Result<()> {
     Ok(())
 }
 
-fn handle(stream: UnixStream, index: Arc<RwLock<Index>>) -> io::Result<()> {
+fn handle(stream: UnixStream, index: Arc<Catalog>) -> io::Result<()> {
     let peer = peer_of(&stream)?;
     // Root may see everything. A non-root daemon's socket is 0600, so its only
     // possible peer is its own user, who can already list what it indexed.
@@ -119,8 +120,8 @@ fn handle(stream: UnixStream, index: Arc<RwLock<Index>>) -> io::Result<()> {
         });
         reply0(&mut writer, result)?;
     } else if line == "STATS" {
-        let ix = index.read().unwrap();
-        writeln!(writer, "entries {} arena {}", ix.len(), ix.capacity_used())?;
+        let (entries, arena) = index.stats();
+        writeln!(writer, "entries {} arena {}", entries, arena)?;
         writeln!(writer)?;
     } else {
         writeln!(writer, "ERR unknown command")?;
@@ -174,23 +175,19 @@ fn reply0(w: &mut impl Write, result: Result<Vec<Vec<u8>>, String>) -> io::Resul
 /// the peer cannot see would leave the page short, so the search is repeated
 /// with a larger window until the page fills or the matches run out.
 fn run_query(
-    index: &RwLock<Index>,
+    index: &Catalog,
     peer: &Peer,
     filter: bool,
     limit: usize,
     search: impl Fn(&Index, usize) -> Result<Vec<Vec<u8>>, String>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if !filter {
-        let ix = index.read().unwrap();
-        return search(&ix, limit);
+        return index.search(limit, &search);
     }
     let mut cache: HashMap<Vec<u8>, bool> = HashMap::new();
     let mut window = limit.max(1);
     loop {
-        let hits = {
-            let ix = index.read().unwrap();
-            search(&ix, window)?
-        };
+        let hits = index.search(window, &search)?;
         let exhausted = hits.len() < window || window >= MAX_LIMIT;
         let mut shown = as_peer(peer, || keep_visible(hits, &mut cache, listable))
             .map_err(|e| format!("cannot check permissions: {}", e))?;

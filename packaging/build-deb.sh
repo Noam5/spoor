@@ -18,6 +18,8 @@ sed 's|/usr/local/bin/spoor|/usr/bin/spoor|' packaging/spoor-gui.desktop \
 install -Dm644 packaging/spoor-krunner.desktop "$ROOT/usr/share/krunner/dbusplugins/spoor.desktop"
 sed 's|@BIN@|/usr/bin/spoor|' packaging/org.kde.spoor.service.in \
     | install -Dm644 /dev/stdin "$ROOT/usr/share/dbus-1/services/org.kde.spoor.service"
+sed 's|@BIN@|/usr/bin/spoor|' packaging/org.spoor.configure.policy.in \
+    | install -Dm644 /dev/stdin "$ROOT/usr/share/polkit-1/actions/org.spoor.configure.policy"
 for f in README.md LICENSE-MIT LICENSE-APACHE; do install -Dm644 "$f" "$ROOT/usr/share/doc/spoor/$f"; done
 
 # Runtime dependencies, computed from the binary rather than guessed.
@@ -36,7 +38,8 @@ Depends: $DEPS, systemd
 Section: utils
 Priority: optional
 Description: instant file-name search for Linux
- A root daemon keeps a trigram index of /home current through fanotify, and
+ A root daemon keeps a trigram index of the folders you choose (by default
+ /home) current through fanotify, and
  serves it over a Unix socket to a CLI, a GTK window and a KDE KRunner plugin.
  Results are filtered by each caller's own permissions.
 EOF
@@ -59,7 +62,7 @@ cat > "$ROOT/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
 [ -d /run/systemd/system ] && systemctl daemon-reload || true
-if [ "$1" = purge ]; then rm -rf /var/lib/spoor; fi
+if [ "$1" = purge ]; then rm -rf /var/lib/spoor /etc/spoor; fi
 EOF
 chmod 755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm" "$ROOT/DEBIAN/postrm"
 dpkg-deb --build --root-owner-group "$ROOT" "$OUT" >/dev/null

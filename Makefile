@@ -17,6 +17,8 @@ install:
 	install -Dm644 packaging/spoor.service /etc/systemd/system/spoor.service
 	install -Dm644 packaging/spoor-gui.desktop \
 	    $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
+	sed 's|@BIN@|$(PREFIX)/bin/spoor|' packaging/org.spoor.configure.policy.in \
+	    | install -Dm644 /dev/stdin /usr/share/polkit-1/actions/org.spoor.configure.policy
 	systemctl daemon-reload
 	-update-desktop-database $(DESTDIR)$(PREFIX)/share/applications 2>/dev/null
 	@echo "installed. enable with: systemctl enable --now spoor"
@@ -25,8 +27,9 @@ uninstall:
 	-systemctl disable --now spoor
 	rm -f /etc/systemd/system/spoor.service $(DESTDIR)$(PREFIX)/bin/spoor
 	rm -f $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
+	rm -f /usr/share/polkit-1/actions/org.spoor.configure.policy
 	systemctl daemon-reload
-	@echo "removed. snapshot left at /var/lib/spoor (delete manually if unwanted)"
+	@echo "removed. left in place: /var/lib/spoor (snapshot), /etc/spoor (settings)"
 
 status:
 	systemctl status spoor --no-pager

@@ -7,18 +7,16 @@ After=local-fs.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/spoor daemon \
-    --root /home \
+    --config /etc/spoor/spoor.conf \
     --socket /run/spoor.sock \
     --state /var/lib/spoor/index.bin \
     --save-interval 60 \
     $SPOOR_EXTRA_ARGS
-# Machine-specific flags go in a drop-in rather than here, e.g.
-# /etc/systemd/system/spoor.service.d/rescan.conf:
-#   [Service]
-#   Environment="SPOOR_EXTRA_ARGS=--rescan /home/you/GoogleDrive --rescan-interval 900"
-# --rescan is for mounts fanotify cannot watch (rclone/FUSE, network). A FUSE
-# mount must admit root: rclone ignores --allow-root, so mount with
-# --allow-other --default-permissions --umask 077 (see README).
+# Which folders to index, exclude and rescan lives in /etc/spoor/spoor.conf,
+# edited from the window's Preferences (through `spoor configure`); with no
+# file, /home is indexed. Extra flags can go in a drop-in as SPOOR_EXTRA_ARGS.
+# A rescanned FUSE mount must admit root: rclone ignores --allow-root, so mount
+# with --allow-other --default-permissions --umask 077 (see README).
 
 # Runs as root: FAN_MARK_FILESYSTEM, FAN_UNLIMITED_QUEUE and
 # FAN_UNLIMITED_MARKS all require CAP_SYS_ADMIN; the DAC capabilities let the

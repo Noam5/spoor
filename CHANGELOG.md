@@ -13,8 +13,11 @@ First public release.
   tree when no trigram applies.
 * Atomic periodic snapshots (root-only) and a reconciliation walk at start-up
   and daily, which also catches changes made while the daemon was down.
-* `--rescan PATH` walks mounts fanotify cannot see (rclone, network
-  filesystems) on a timer, never while they are unmounted.
+* Any set of folders, each watched with its own fanotify mark, plus excluded
+  folders and network folders. They are chosen in Preferences, stored in
+  `/etc/spoor/spoor.conf` and applied through polkit.
+* Network folders (rclone, network filesystems), which fanotify cannot see,
+  are walked on a timer, and never while they are unmounted.
 * Every reply is filtered by the caller's own permissions, checked by the
   kernel under the caller's credentials.
 * File names are kept as raw bytes, so names that are not UTF-8, or that

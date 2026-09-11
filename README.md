@@ -70,8 +70,9 @@ process start-up, since the binary links GTK.
     sudo systemctl enable --now spoor
     make install-krunner           # optional, per user, needs no root
 
-or build a Debian package with `make deb` and install that. The daemon indexes
-`/home`. `sudo make uninstall` removes it again.
+or build a Debian package with `make deb` and install that. By default the
+daemon indexes `/home`; see [Choosing folders](#choosing-folders).
+`sudo make uninstall` removes it again.
 
 ## Searching
 
@@ -110,18 +111,33 @@ Copy Path, Copy Name, Move to Trash and Properties (the file manager's own
 dialog, via `org.freedesktop.FileManager1`). With the KRunner plugin,
 Alt+Space finds files from anywhere.
 
+## Choosing folders
+
+**Edit → Preferences** in the window lists the folders to index, folders to
+leave out, and network folders to walk on a timer. **Apply Folder Changes…**
+asks for an administrator password (polkit), saves `/etc/spoor/spoor.conf` and
+restarts the index. The file can also be written by hand:
+
+    root = /home
+    root = /srv/data
+    exclude = /home/you/.cache
+    rescan = /home/you/GoogleDrive
+    rescan_interval = 900
+
+`sudo spoor configure FILE` checks such a file, installs it and restarts the
+service. Each folder gets its own fanotify mark, so folders on different disks
+are all watched live. A folder inside another folder on the same filesystem is
+merged into it. A folder on a disk that is not attached is skipped until the
+next restart.
+
 ## Network and FUSE mounts
 
 fanotify only sees changes that pass through the local kernel, and the walk
 stays on one filesystem, so a mount such as an rclone Google Drive is not
-indexed by default. `--rescan PATH` (repeatable) walks it every
-`--rescan-interval` seconds (default 900) instead. A path that is not currently
-mounted is never walked -- it would read as an empty folder -- and is retried
-every minute. Put machine-specific flags in a drop-in:
-
-    # /etc/systemd/system/spoor.service.d/rescan.conf
-    [Service]
-    Environment="SPOOR_EXTRA_ARGS=--rescan /home/you/GoogleDrive"
+indexed by default. Listed under **Network folders** (`rescan =`), it is
+walked every `rescan_interval` seconds (default 900) instead; it must lie inside
+an indexed folder. A path that is not currently mounted is never walked -- it
+would read as an empty folder -- and is retried every minute.
 
 A FUSE mount is private to its owner, so root cannot read it by default.
 rclone accepts `--allow-root` but silently ignores it (its FUSE library dropped
@@ -142,7 +158,8 @@ The daemon runs as root and can list every name under the indexed tree; any
 local account may query it. Each result is shown only if the caller could list
 its folder: the answering thread takes on the caller's uid, gid and groups
 (read from the socket, not from the request) and asks the kernel. The
-snapshot under `/var/lib/spoor` is readable by root only, the socket's work
+snapshot under `/var/lib/spoor` is readable by root only; changing which
+folders are indexed needs an administrator password; the socket's work
 per client is bounded, and kernel records are parsed with explicit bounds
 checks. See [SECURITY.md](SECURITY.md) for the details and for reporting
 vulnerabilities.
@@ -164,7 +181,6 @@ forms withhold paths containing a newline; use `SEARCH0`.
 
 ## Known gaps
 
-* A single indexed root.
 * Deleted entries keep their memory until the daily reconciliation swaps in a
   freshly built index (or the daemon restarts).
 * A multi-word query whose words are all shorter than 3 bytes falls back to a
