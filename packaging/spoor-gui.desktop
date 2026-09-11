@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=File Search (spoor)
+GenericName=File Search
+Comment=Find files instantly by name or path
+Exec=/usr/local/bin/spoor gui
+Icon=system-search
+Terminal=false
+Categories=Utility;FileTools;System;
+Keywords=search;find;file;locate;everything;
+StartupNotify=true

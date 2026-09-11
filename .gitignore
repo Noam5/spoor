@@ -1,0 +1,6 @@
+/target
+*.bin
+core
+core.*
+# private development notes, kept locally
+HANDOFF.md

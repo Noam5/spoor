@@ -1,0 +1,20 @@
+[Desktop Entry]
+Name=File Search (spoor)
+Comment=Find files by name or path using the spoor index
+X-KDE-ServiceTypes=Plasma/Runner
+Type=Service
+Icon=system-search
+X-KDE-PluginInfo-Name=spoor
+X-KDE-PluginInfo-Version=1.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
+
+# DBus2 so KRunner calls Config() and picks up MinLetterCount. Each Match is a
+# full index scan, so running one for a single letter would be wasteful.
+X-Plasma-API=DBus2
+X-Plasma-DBusRunner-Service=org.kde.spoor
+X-Plasma-DBusRunner-Path=/runner
+X-Plasma-Request-Actions-Once=true
+X-Plasma-Runner-Min-Letter-Count=3
+X-Plasma-Runner-Syntaxes=:q:
+X-Plasma-Runner-Syntax-Descriptions=Finds files whose name or path matches :q:

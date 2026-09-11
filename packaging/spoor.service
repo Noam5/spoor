@@ -1,0 +1,56 @@
+[Unit]
+Description=spoor file index daemon
+After=local-fs.target
+# The index is rebuilt from a full walk on every start, so nothing depends on
+# ordering against the snapshot; it only makes startup queries available sooner.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spoor daemon \
+    --root /home \
+    --socket /run/spoor.sock \
+    --state /var/lib/spoor/index.bin \
+    --save-interval 60 \
+    $SPOOR_EXTRA_ARGS
+# Machine-specific flags go in a drop-in rather than here, e.g.
+# /etc/systemd/system/spoor.service.d/rescan.conf:
+#   [Service]
+#   Environment="SPOOR_EXTRA_ARGS=--rescan /home/you/GoogleDrive --rescan-interval 900"
+# --rescan is for mounts fanotify cannot watch (rclone/FUSE, network). A FUSE
+# mount must admit root: rclone ignores --allow-root, so mount with
+# --allow-other --default-permissions --umask 077 (see README).
+
+# Runs as root: FAN_MARK_FILESYSTEM, FAN_UNLIMITED_QUEUE and
+# FAN_UNLIMITED_MARKS all require CAP_SYS_ADMIN. Nothing else is needed, so the
+# bounding set is narrowed to just those.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+
+# systemd creates and owns /var/lib/spoor for the snapshot.
+StateDirectory=spoor
+# The snapshot holds every indexed file name: root only.
+StateDirectoryMode=0700
+UMask=0077
+
+# Read-only everywhere except the snapshot and the socket.
+ProtectSystem=strict
+ReadWritePaths=/run /var/lib/spoor
+# MUST stay 'no': indexing /home is the entire point, and ProtectHome would
+# hide it from the daemon.
+ProtectHome=no
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+
+Restart=on-failure
+RestartSec=5
+
+# The daemon reacts to SIGTERM by writing a final snapshot before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
