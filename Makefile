@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 BIN    := target/release/spoor
 
-.PHONY: build test install uninstall status logs install-krunner uninstall-krunner
+.PHONY: build test install uninstall status logs install-krunner uninstall-krunner deb
 
 build:
 	cargo build --release
@@ -49,3 +49,7 @@ uninstall-krunner:
 	rm -f $(HOME)/.local/share/krunner/dbusplugins/spoor.desktop
 	rm -f $(HOME)/.local/share/dbus-1/services/org.kde.spoor.service
 	@echo "removed. restart krunner:  kquitapp6 krunner"
+
+# Debian/Ubuntu package in target/deb/ (installs to /usr, enables the service).
+deb: build
+	packaging/build-deb.sh
