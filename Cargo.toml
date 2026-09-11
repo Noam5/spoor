@@ -2,6 +2,8 @@
 name = "spoor"
 version = "0.1.0"
 edition = "2021"
+# zbus 5 needs 1.87; str::utf8_chunks alone would need 1.79.
+rust-version = "1.87"
 description = "Instant file-name search for Linux: a root fanotify daemon with CLI, GTK and KRunner front ends"
 license = "MIT OR Apache-2.0"
 readme = "README.md"

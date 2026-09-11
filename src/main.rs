@@ -132,6 +132,7 @@ fn main() {
                 println!("  {:<24} {:7.2} ms   ({} hits)", pat, per, hits);
             }
         }
+        "--version" | "-V" | "version" => println!("spoor {}", env!("CARGO_PKG_VERSION")),
         "stats" => {
             let sock = arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string());
             client(&sock, "STATS");
@@ -145,6 +146,7 @@ fn main() {
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
             eprintln!("                        [--files|--folders] [--no-hidden] [--null]");
             eprintln!("  spoor stats");
+            eprintln!("  spoor --version");
             eprintln!("  spoor bench <pattern>… [--opts FLAGS] [--n N]  (server-side timing)");
             eprintln!("  spoor krunner            (KDE KRunner D-Bus runner)");
             eprintln!("  spoor gui [--socket PATH] (standalone window)");

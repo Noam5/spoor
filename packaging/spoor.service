@@ -1,8 +1,8 @@
 [Unit]
 Description=spoor file index daemon
 After=local-fs.target
-# The index is rebuilt from a full walk on every start, so nothing depends on
-# ordering against the snapshot; it only makes startup queries available sooner.
+# The snapshot is served as soon as it loads, while a reconciliation walk runs
+# behind it; nothing else needs ordering.
 
 [Service]
 Type=simple
@@ -21,8 +21,8 @@ ExecStart=/usr/local/bin/spoor daemon \
 # --allow-other --default-permissions --umask 077 (see README).
 
 # Runs as root: FAN_MARK_FILESYSTEM, FAN_UNLIMITED_QUEUE and
-# FAN_UNLIMITED_MARKS all require CAP_SYS_ADMIN. Nothing else is needed, so the
-# bounding set is narrowed to just those.
+# FAN_UNLIMITED_MARKS all require CAP_SYS_ADMIN; the DAC capabilities let the
+# walk and open_by_handle_at reach every directory.
 # CAP_SETUID and CAP_SETGID let a query thread take on the caller's filesystem
 # identity, so results are filtered by what that user may list (see ipc.rs).
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID
@@ -46,6 +46,16 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
+# Nothing below is used by a fanotify daemon, so it all goes.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
 
 Restart=on-failure
 RestartSec=5

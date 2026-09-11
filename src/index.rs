@@ -4,6 +4,7 @@
 //! parent id, so a path is reconstructed by walking up. That keeps memory
 //! proportional to total name bytes rather than to total path bytes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub const NO_PARENT: u32 = u32::MAX;
@@ -288,7 +289,7 @@ impl Index {
     fn insert(&mut self, parent: u32, name: &[u8], is_dir: bool, ino: u64) -> u32 {
         let id = self.entries.len() as u32;
         if self.trigrams_built {
-            for_each_trigram(name, |key| {
+            for_each_trigram(&fold(name), |key| {
                 self.trigrams.entry(key).or_default().push(id);
             });
         }
@@ -428,11 +429,7 @@ impl Index {
             return Ok(Vec::new());
         };
         let in_path = o.in_path || term.contains('/');
-        let needle = if o.match_case {
-            term
-        } else {
-            term.to_ascii_lowercase()
-        };
+        let needle = if o.match_case { term } else { fold_str(&term) };
         if in_path {
             if let Some(hits) = self.search_path_trigram(&needle, limit, o) {
                 return Ok(hits);
@@ -480,7 +477,7 @@ impl Index {
         let mut map: HashMap<u32, Postings> = HashMap::with_capacity(1 << 17);
         for (i, e) in self.entries.iter().enumerate() {
             let id = i as u32;
-            for_each_trigram(&e.name, |key| {
+            for_each_trigram(&fold(&e.name), |key| {
                 map.entry(key).or_default().push(id);
             });
         }
@@ -496,7 +493,7 @@ impl Index {
         (self.trigrams.len(), postings)
     }
 
-    /// `needle` is already lowercased unless `o.match_case` is set. Trigram
+    /// `needle` is already folded unless `o.match_case` is set. Trigram
     /// keys are case-folded, so candidates are a superset of case-sensitive
     /// matches as well; verification decides.
     fn search_name(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
@@ -531,7 +528,9 @@ impl Index {
     /// any trigram is unknown, which means no name can contain the needle.
     fn trigram_candidates(&self, needle: &str) -> Option<Vec<u32>> {
         let mut keys: Vec<u32> = Vec::new();
-        for_each_trigram(needle.as_bytes(), |k| keys.push(k));
+        // Keys are folded even for a case-sensitive needle: the index holds
+        // folded keys, and verification restores exactness.
+        for_each_trigram(&fold(needle.as_bytes()), |k| keys.push(k));
         keys.sort_unstable();
         keys.dedup();
         if keys.is_empty() {
@@ -684,7 +683,7 @@ impl Index {
         let folded: Vec<String> = terms
             .iter()
             .take(64)
-            .map(|t| if cs { t.clone() } else { t.to_ascii_lowercase() })
+            .map(|t| if cs { t.clone() } else { fold_str(t) })
             .collect();
         if !self.trigrams_built || self.root == NO_PARENT {
             return self.search_multi_scan(&folded, limit, o);
@@ -783,7 +782,7 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let fold = !o.match_case;
+        let ci = !o.match_case;
         let pats: Vec<&[u8]> = terms[..k].iter().map(|t| t.as_bytes()).collect();
         let fails: Vec<Vec<usize>> = pats.iter().map(|p| kmp_failure(p)).collect();
         let full: u64 = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
@@ -798,6 +797,7 @@ impl Index {
             let root = e.parent == NO_PARENT;
             let pi = e.parent as usize;
             let mut m = if root { 0 } else { mask[pi] };
+            let name = if ci { fold(&e.name) } else { Cow::Borrowed(&e.name[..]) };
             for t in 0..k {
                 let (p, f) = (pats[t], &fails[t]);
                 let mut st = if root { 0 } else { state[pi * k + t] as usize };
@@ -808,8 +808,8 @@ impl Index {
                         m |= 1 << t;
                     }
                 }
-                for &b in e.name.iter() {
-                    let c = if fold { b.to_ascii_lowercase() } else { b };
+                for &b in name.iter() {
+                    let c = if ci { b.to_ascii_lowercase() } else { b };
                     let (ns, h) = kmp_step(st, c, p, f);
                     st = ns;
                     if h {
@@ -842,7 +842,7 @@ impl Index {
     /// always allocated after its parent.
     fn search_path(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
         let pat = needle.as_bytes();
-        let fold = !o.match_case;
+        let ci = !o.match_case;
         let fail = kmp_failure(pat);
         let n = self.entries.len();
         let mut state = vec![0u32; n];
@@ -866,8 +866,9 @@ impl Index {
                 k = nk;
                 hit |= h;
             }
-            for &b in e.name.iter() {
-                let c = if fold { b.to_ascii_lowercase() } else { b };
+            let name = if ci { fold(&e.name) } else { Cow::Borrowed(&e.name[..]) };
+            for &b in name.iter() {
+                let c = if ci { b.to_ascii_lowercase() } else { b };
                 let (nk, h) = kmp_step(k, c, pat, &fail);
                 k = nk;
                 hit |= h;
@@ -997,14 +998,19 @@ pub fn split_terms(q: &str) -> Vec<String> {
     out
 }
 
-/// Suffix test; `suffix` must already be lowercased when case-insensitive.
+/// Suffix test; `suffix` must already be folded when case-insensitive.
 #[inline]
 fn ends_with(haystack: &[u8], suffix: impl AsRef<[u8]>, case_sensitive: bool) -> bool {
     let suffix = suffix.as_ref();
-    if haystack.len() < suffix.len() {
+    let h = if case_sensitive {
+        Cow::Borrowed(haystack)
+    } else {
+        fold(haystack)
+    };
+    if h.len() < suffix.len() {
         return false;
     }
-    let tail = &haystack[haystack.len() - suffix.len()..];
+    let tail = &h[h.len() - suffix.len()..];
     if case_sensitive {
         tail == suffix
     } else {
@@ -1012,15 +1018,43 @@ fn ends_with(haystack: &[u8], suffix: impl AsRef<[u8]>, case_sensitive: bool) ->
     }
 }
 
-/// Substring test; `needle` must already be lowercased when case-insensitive.
+/// Substring test; `needle` must already be folded when case-insensitive.
 #[inline]
 fn contains(haystack: &[u8], needle: impl AsRef<[u8]>, case_sensitive: bool) -> bool {
     let needle = needle.as_ref();
     if case_sensitive {
         needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
     } else {
-        contains_ascii_ci(haystack, needle)
+        contains_ascii_ci(&fold(haystack), needle)
     }
+}
+
+/// Case-folds a name for case-insensitive matching: each character is
+/// lowercased on its own, so a folded name contains the folded needle whenever
+/// the name contains the needle. (str::to_lowercase has a context rule, the
+/// final sigma, that would break this.) ASCII names -- nearly all of them --
+/// are borrowed as they are, since every consumer lowercases ASCII bytes on the
+/// fly; so do bytes that are not UTF-8, which are kept unchanged.
+fn fold(b: &[u8]) -> Cow<'_, [u8]> {
+    if b.is_ascii() {
+        return Cow::Borrowed(b);
+    }
+    let mut out = Vec::with_capacity(b.len() + 4);
+    let mut buf = [0u8; 4];
+    for chunk in b.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            for l in c.to_lowercase() {
+                out.extend_from_slice(l.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    Cow::Owned(out)
+}
+
+/// A query term, folded as `fold` folds names.
+fn fold_str(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// Every 3-byte window of `b`, ASCII-lowercased, packed into a u32.
@@ -1602,6 +1636,43 @@ mod tests {
     }
 
     #[test]
+    fn case_folding_is_unicode_aware() {
+        for built in [false, true] {
+            let mut ix = Index::new();
+            let root = ix.add(NO_PARENT, "/home", true, 1);
+            ix.set_root(root);
+            let d = ix.add(root, "ÉCOLE", true, 2);
+            ix.add(d, "Отчёт-2024.pdf", false, 3);
+            ix.add(d, "ΣΟΦΙΑ.txt", false, 4);
+            if built {
+                ix.build_trigrams();
+            }
+            let report = vec!["/home/ÉCOLE/Отчёт-2024.pdf".to_string()];
+            let sofia = vec!["/home/ÉCOLE/ΣΟΦΙΑ.txt".to_string()];
+            assert_eq!(ix.search("отчёт", 10), report, "built={}", built);
+            assert_eq!(ix.search("ОТЧЁТ", 10), report);
+            assert_eq!(ix.search("σοφια", 10), sofia); // Σ is not word-final here
+            assert_eq!(ix.search("école/", 10).len(), 2); // inside a folder
+            assert_eq!(ix.search("cole/σοφ", 10), sofia); // path, via trigrams
+            assert_eq!(ix.search("/é", 10).len(), 3); // path, via the automaton
+            assert_eq!(ix.search("école отчёт", 10), report); // several words
+            assert_eq!(ix.search("/é φ", 10), sofia); // several short words
+            let cs = SearchOpts { match_case: true, ..Default::default() };
+            assert_eq!(ix.search_opts("Отчёт", 10, &cs).unwrap(), report);
+            assert!(ix.search_opts("отчёт", 10, &cs).unwrap().is_empty());
+            let rx = SearchOpts { regex: true, ..Default::default() };
+            assert_eq!(ix.search_opts("^σοφια", 10, &rx).unwrap(), sofia);
+        }
+    }
+
+    #[test]
+    fn folding_keeps_stray_bytes_and_ascii() {
+        assert!(matches!(fold(b"Plain.TXT"), Cow::Borrowed(_)));
+        assert_eq!(&*fold(b"\xc3\x89T\xe9"), b"\xc3\xa9t\xe9"); // "ÉT" + a Latin-1 byte
+        assert_eq!(fold_str("ΣΟΦΙΑ"), "σοφια");
+    }
+
+    #[test]
     fn query_splitting() {
         assert_eq!(split_terms("a b"), vec!["a", "b"]);
         assert_eq!(split_terms("  a   b  "), vec!["a", "b"]);
@@ -1871,7 +1942,7 @@ impl Index {
     fn insert_foreign(&mut self, parent: u32, name: &[u8], is_dir: bool) -> u32 {
         let id = self.entries.len() as u32;
         if self.trigrams_built {
-            for_each_trigram(name, |key| self.trigrams.entry(key).or_default().push(id));
+            for_each_trigram(&fold(name), |key| self.trigrams.entry(key).or_default().push(id));
         }
         self.entries.push(Entry {
             parent,
