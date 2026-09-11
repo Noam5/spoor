@@ -20,7 +20,8 @@ mod scan;
 mod watch;
 
 use index::{Index, Kind, SearchOpts};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 const DEFAULT_SOCK: &str = "/run/spoor.sock";
@@ -46,6 +47,9 @@ fn main() {
             let rescan_interval: u64 = arg_value(&args, "--rescan-interval")
                 .and_then(|d| d.parse().ok())
                 .unwrap_or(900);
+            let reconcile_interval: u64 = arg_value(&args, "--reconcile-interval")
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(86_400);
             daemon(
                 &root,
                 &sock,
@@ -55,6 +59,7 @@ fn main() {
                 save_interval,
                 rescan,
                 rescan_interval,
+                reconcile_interval,
             );
         }
         "query" => {
@@ -131,6 +136,7 @@ fn main() {
             eprintln!("  spoor daemon [--root /home] [--socket PATH] [--state PATH]");
             eprintln!("                     [--save-interval SECS] [--duration SECS] [--no-watch]");
             eprintln!("                     [--rescan PATH]... [--rescan-interval SECS]");
+            eprintln!("                     [--reconcile-interval SECS]  (default 86400, 0 = never)");
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
             eprintln!("                        [--files|--folders] [--no-hidden]");
             eprintln!("  spoor stats");
@@ -145,7 +151,7 @@ fn main() {
 /// Flags that consume the following argument; any other "--x" is a switch.
 const VALUE_FLAGS: &[&str] = &[
     "--socket", "--limit", "--n", "--root", "--state", "--save-interval", "--duration", "--opts",
-    "--rescan", "--rescan-interval",
+    "--rescan", "--rescan-interval", "--reconcile-interval",
 ];
 
 /// Every value of a repeatable flag.
@@ -187,6 +193,7 @@ fn daemon(
     save_interval: u64,
     rescan: Vec<String>,
     rescan_interval: u64,
+    reconcile_interval: u64,
 ) {
     if watch_enabled && unsafe { libc::geteuid() } != 0 {
         eprintln!("spoor: must run as root (FAN_MARK_FILESYSTEM needs CAP_SYS_ADMIN)");
@@ -264,6 +271,9 @@ fn daemon(
         postings
     );
     *index.write().unwrap() = fresh;
+    // Last successful listing of each rescanned mount, so a reconciliation can
+    // graft it into the fresh index instead of waiting for the next rescan.
+    let listings: Listings = Arc::new(Mutex::new(HashMap::new()));
 
     // Mounts fanotify cannot watch are walked on a timer instead. Started only
     // now, after the swap, so the first graft lands in the live index rather
@@ -275,7 +285,18 @@ fn daemon(
             rescan_interval
         );
         let rescan_index = Arc::clone(&index);
-        std::thread::spawn(move || rescan_loop(rescan_index, rescan, rescan_interval));
+        let rescan_listings = Arc::clone(&listings);
+        std::thread::spawn(move || {
+            rescan_loop(rescan_index, rescan, rescan_interval, rescan_listings)
+        });
+    }
+    if reconcile_interval > 0 {
+        let rec_index = Arc::clone(&index);
+        let rec_root = root.to_string();
+        let rec_listings = Arc::clone(&listings);
+        std::thread::spawn(move || {
+            reconcile_loop(rec_index, rec_root, reconcile_interval, rec_listings)
+        });
     }
 
     // Periodic snapshot, so a kill costs at most one interval.
@@ -324,6 +345,12 @@ fn daemon(
                             continue;
                         }
                         let mut ix = index.write().unwrap();
+                        // Under the write lock, so a reconciliation swapping
+                        // the index sees each batch either captured or not yet
+                        // read -- never half of it.
+                        if let Some(buf) = CAPTURE.lock().unwrap().as_mut() {
+                            buf.extend(events.iter().cloned());
+                        }
                         for ev in &events {
                             apply(&mut ix, ev);
                         }
@@ -350,11 +377,65 @@ fn daemon(
     let _ = std::fs::remove_file(sock);
 }
 
+type Listings = Arc<Mutex<HashMap<String, Vec<(u32, String, bool)>>>>;
+
+/// Events applied while a reconciliation walk runs, kept for replay onto the
+/// fresh index. Pushed and taken only under the index write lock, so every
+/// event is either replayed or applied after the swap: never lost, never twice.
+static CAPTURE: Mutex<Option<Vec<watch::Event>>> = Mutex::new(None);
+
+/// Rebuild the index from a fresh walk on a timer. This compacts the arena
+/// (dead entries otherwise accumulate for as long as the daemon runs) and
+/// corrects drift from any event that could not be applied. Changes made
+/// during the walk are captured and replayed before the new index is swapped
+/// in. Memory peaks at two indexes for the length of the walk.
+fn reconcile_loop(index: Arc<RwLock<Index>>, root: String, interval: u64, listings: Listings) {
+    let stopping = || SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        for _ in 0..interval {
+            if stopping() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let t0 = Instant::now();
+        *CAPTURE.lock().unwrap() = Some(Vec::new());
+        let mut fresh = Index::new();
+        let st = scan::scan(&mut fresh, &root);
+        for (path, list) in listings.lock().unwrap().iter() {
+            if let Some(mount) = fresh.resolve_path(path) {
+                fresh.graft(mount, list);
+            }
+        }
+        fresh.build_trigrams();
+        let (before, after, replayed) = {
+            let mut ix = index.write().unwrap();
+            let events = CAPTURE.lock().unwrap().take().unwrap_or_default();
+            for ev in &events {
+                apply(&mut fresh, ev);
+            }
+            let before = ix.capacity_used();
+            let after = fresh.capacity_used();
+            *ix = fresh;
+            (before, after, events.len())
+        };
+        eprintln!(
+            "spoor: reconciled in {:.1}s: {} files + {} dirs, arena {} -> {} slots, {} events replayed",
+            t0.elapsed().as_secs_f64(),
+            st.files,
+            st.dirs,
+            before,
+            after,
+            replayed
+        );
+    }
+}
+
 /// Keeps unwatchable mounts current by walking them on a timer. A mount that
 /// is not available yet (rclone has not mounted it, or it refuses root) is
 /// retried every minute instead of waiting out the whole interval -- at boot,
 /// spoor usually starts before the network mount does.
-fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64) {
+fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, listings: Listings) {
     const RETRY: u64 = 60;
     let stopping = || SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed);
     loop {
@@ -381,6 +462,7 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64) {
                         Some(mount) => {
                             let st = ix.graft(mount, &list);
                             drop(ix);
+                            listings.lock().unwrap().insert(p.clone(), list);
                             eprintln!(
                                 "spoor: rescanned {}: {} entries (+{} -{}), walked in {:.1}s, merged in {:.0}ms{}",
                                 p,
