@@ -23,3 +23,14 @@ jobs:
         run: sudo ./target/release/spoor selftest --root "$RUNNER_TEMP"
       - name: Debian package
         run: make deb
+
+  # Cargo.toml declares rust-version; make sure it is true.
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: GTK development files
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@1.87
+      - name: Build with the oldest supported compiler
+        run: cargo check --release --all-targets --locked

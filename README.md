@@ -165,7 +165,8 @@ forms withhold paths containing a newline; use `SEARCH0`.
 ## Known gaps
 
 * A single indexed root.
-* The arena is only compacted on restart; dead entries accumulate while running.
+* Deleted entries keep their memory until the daily reconciliation swaps in a
+  freshly built index (or the daemon restarts).
 * A multi-word query whose words are all shorter than 3 bytes falls back to a
   full scan (up to ~0.9 s on 2.3M files when matches are rare).
 * Case folding is per character (`ß` does not match `ss`), and in regex mode

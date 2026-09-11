@@ -48,7 +48,11 @@ pub fn serve(sock_path: &str, index: Arc<RwLock<Index>>) -> io::Result<()> {
     // A root daemon filters every reply by the caller's permissions, so anyone
     // may connect. A daemon running as an ordinary user cannot check on other
     // users' behalf, so its socket is private to its owner.
-    let mode = if unsafe { libc::geteuid() } == 0 { 0o666 } else { 0o600 };
+    let mode = if unsafe { libc::geteuid() } == 0 {
+        0o666
+    } else {
+        0o600
+    };
     let _ = std::fs::set_permissions(
         sock_path,
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
@@ -92,7 +96,9 @@ fn handle(stream: UnixStream, index: Arc<RwLock<Index>>) -> io::Result<()> {
         let mut parts = rest.splitn(2, ' ');
         let limit = parse_limit(parts.next());
         let pattern = parts.next().unwrap_or("");
-        let result = run_query(&index, &peer, filter, limit, |ix, n| Ok(ix.search_raw(pattern, n)));
+        let result = run_query(&index, &peer, filter, limit, |ix, n| {
+            Ok(ix.search_raw(pattern, n))
+        });
         reply(&mut writer, result)?;
     } else if let Some(rest) = line.strip_prefix("SEARCH ") {
         let mut parts = rest.splitn(3, ' ');
@@ -309,7 +315,11 @@ fn as_peer<T>(p: &Peer, f: impl FnOnce() -> T) -> io::Result<T> {
     use libc::{c_long, syscall, SYS_getgroups, SYS_setfsgid, SYS_setfsuid, SYS_setgroups};
     const QUERY: c_long = u32::MAX as c_long; // an invalid id: reports without changing
     unsafe {
-        let n = syscall(SYS_getgroups, 0 as c_long, std::ptr::null_mut::<libc::gid_t>());
+        let n = syscall(
+            SYS_getgroups,
+            0 as c_long,
+            std::ptr::null_mut::<libc::gid_t>(),
+        );
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -422,7 +432,11 @@ mod tests {
         }
         // an unprivileged thread may not set groups: the switch must refuse,
         // and the callback must never run
-        let p = Peer { uid: 65534, gid: 65534, groups: vec![65534] };
+        let p = Peer {
+            uid: 65534,
+            gid: 65534,
+            groups: vec![65534],
+        };
         let ran = std::cell::Cell::new(false);
         assert!(as_peer(&p, || ran.set(true)).is_err());
         assert!(!ran.get());
@@ -431,7 +445,11 @@ mod tests {
     #[test]
     fn line_framing_never_sends_a_newline_path() {
         let mut out = Vec::new();
-        reply(&mut out, Ok(vec![b("/a"), b("/evil\n/etc/shadow"), b("/b")])).unwrap();
+        reply(
+            &mut out,
+            Ok(vec![b("/a"), b("/evil\n/etc/shadow"), b("/b")]),
+        )
+        .unwrap();
         assert_eq!(out, b"/a\n/b\n\n");
     }
 

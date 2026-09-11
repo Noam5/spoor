@@ -60,7 +60,10 @@ impl Settings {
             max_results: 500,
         };
         let kf = glib::KeyFile::new();
-        if kf.load_from_file(Self::file(), glib::KeyFileFlags::NONE).is_err() {
+        if kf
+            .load_from_file(Self::file(), glib::KeyFileFlags::NONE)
+            .is_err()
+        {
             return s;
         }
         if let Ok(v) = kf.boolean("search", "match_case") {
@@ -203,6 +206,9 @@ fn build(app: &Application, socket: String) {
     ] {
         let r = CellRendererText::new();
         r.set_property("ellipsize", gtk::pango::EllipsizeMode::End);
+        // A name may contain a newline; draw it as a symbol on one line
+        // instead of a second line that the fixed row height would clip.
+        r.set_property("single-paragraph-mode", true);
         let c = TreeViewColumn::new();
         c.set_title(title);
         CellLayoutExt::pack_start(&c, &r, true);
@@ -375,29 +381,44 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     }
     {
         let ui = ui.clone();
-        action(&file, "Open Containing _Folder", Some((accel, "<Control>Return")), move || {
-            if let Some(p) = selected_path(&ui) {
-                open(parent_dir(&p));
-            }
-        });
+        action(
+            &file,
+            "Open Containing _Folder",
+            Some((accel, "<Control>Return")),
+            move || {
+                if let Some(p) = selected_path(&ui) {
+                    open(parent_dir(&p));
+                }
+            },
+        );
     }
     file.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action(&file, "P_roperties…", Some((accel, "<Alt>Return")), move || show_properties(&ui));
+        action(
+            &file,
+            "P_roperties…",
+            Some((accel, "<Alt>Return")),
+            move || show_properties(&ui),
+        );
     }
     file.append(&SeparatorMenuItem::new());
     {
         let win = ui.window.clone();
-        action(&file, "_Quit", Some((accel, "<Control>q")), move || win.close());
+        action(&file, "_Quit", Some((accel, "<Control>q")), move || {
+            win.close()
+        });
     }
 
     let edit = submenu(bar, "_Edit");
     {
         let ui = ui.clone();
-        action(&edit, "Copy _Path", Some((accel, "<Control><Shift>c")), move || {
-            copy_selected(&ui, false)
-        });
+        action(
+            &edit,
+            "Copy _Path",
+            Some((accel, "<Control><Shift>c")),
+            move || copy_selected(&ui, false),
+        );
     }
     {
         let ui = ui.clone();
@@ -406,9 +427,12 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     edit.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action(&edit, "_Preferences", Some((accel, "<Control>p")), move || {
-            show_preferences(&ui)
-        });
+        action(
+            &edit,
+            "_Preferences",
+            Some((accel, "<Control>p")),
+            move || show_preferences(&ui),
+        );
     }
 
     // Same labels and shortcuts as FSearch. Everything calls "Search in Path"
@@ -416,21 +440,33 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     let search = submenu(bar, "_Search");
     {
         let ui = ui.clone();
-        toggle(&search, "Match _Case", Some((accel, "<Control>i")), s.opts.match_case, move |on| {
-            set_opt(&ui, |o| o.match_case = on)
-        });
+        toggle(
+            &search,
+            "Match _Case",
+            Some((accel, "<Control>i")),
+            s.opts.match_case,
+            move |on| set_opt(&ui, |o| o.match_case = on),
+        );
     }
     {
         let ui = ui.clone();
-        toggle(&search, "Enable _Regex", Some((accel, "<Control>r")), s.opts.regex, move |on| {
-            set_opt(&ui, |o| o.regex = on)
-        });
+        toggle(
+            &search,
+            "Enable _Regex",
+            Some((accel, "<Control>r")),
+            s.opts.regex,
+            move |on| set_opt(&ui, |o| o.regex = on),
+        );
     }
     {
         let ui = ui.clone();
-        toggle(&search, "Search in _Path", Some((accel, "<Control>u")), s.opts.in_path, move |on| {
-            set_opt(&ui, |o| o.in_path = on)
-        });
+        toggle(
+            &search,
+            "Search in _Path",
+            Some((accel, "<Control>u")),
+            s.opts.in_path,
+            move |on| set_opt(&ui, |o| o.in_path = on),
+        );
     }
     search.append(&SeparatorMenuItem::new());
     let all = RadioMenuItem::builder()
@@ -439,7 +475,11 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
         .build();
     let files = RadioMenuItem::with_mnemonic_from_widget(&all, Some("_Files Only"));
     let folders = RadioMenuItem::with_mnemonic_from_widget(&all, Some("F_olders Only"));
-    let radios = [(all, Kind::All), (files, Kind::Files), (folders, Kind::Folders)];
+    let radios = [
+        (all, Kind::All),
+        (files, Kind::Files),
+        (folders, Kind::Folders),
+    ];
     for (item, kind) in &radios {
         search.append(item);
         if s.opts.kind == *kind {
@@ -458,7 +498,9 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     let help = submenu(bar, "_Help");
     {
         let ui = ui.clone();
-        action(&help, "_Search Syntax", Some((accel, "F1")), move || show_syntax(&ui));
+        action(&help, "_Search Syntax", Some((accel, "F1")), move || {
+            show_syntax(&ui)
+        });
     }
     {
         let ui = ui.clone();
@@ -532,7 +574,11 @@ fn set_opt(ui: &Rc<Ui>, f: impl FnOnce(&mut SearchOpts)) {
 /// that the next keystroke would supersede.
 fn schedule_search(ui: &Rc<Ui>) {
     cancel_pending(ui);
-    let delay = if ui.settings.borrow().opts.regex { 300 } else { 40 };
+    let delay = if ui.settings.borrow().opts.regex {
+        300
+    } else {
+        40
+    };
     let ui2 = ui.clone();
     let id = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
         // Forget the id before running: removing a source that already fired
@@ -564,7 +610,8 @@ fn run_search(ui: &Rc<Ui>) {
     if pattern.is_empty() {
         ui.shown.set(seq);
         clear_results(ui);
-        ui.status.set_text(&format!("type to search{}", badges(&s.opts)));
+        ui.status
+            .set_text(&format!("type to search{}", badges(&s.opts)));
         return;
     }
 
@@ -584,7 +631,7 @@ fn run_search(ui: &Rc<Ui>) {
     let ui = ui.clone();
     glib::MainContext::default().spawn_local(async move {
         let limit = s.max_results as usize;
-        let opts = s.opts.clone();
+        let opts = s.opts;
         let job = gio::spawn_blocking(move || {
             let t0 = Instant::now();
             let hits = crate::query::search(&socket, &pattern, limit, &opts);
@@ -729,7 +776,7 @@ fn group_digits(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -773,7 +820,7 @@ fn open_with(ui: &Ui) {
     dialog.connect_response(move |d, resp| {
         if resp == ResponseType::Ok {
             if let Some(app) = d.app_info() {
-                let _ = app.launch(&[file.clone()], None::<&gio::AppLaunchContext>);
+                let _ = app.launch(std::slice::from_ref(&file), None::<&gio::AppLaunchContext>);
             }
         }
         d.close();
@@ -793,7 +840,8 @@ fn show_properties(ui: &Rc<Ui>) {
     let conn = match gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) {
         Ok(c) => c,
         Err(e) => {
-            ui.status.set_text(&format!("could not open Properties: {}", e.message()));
+            ui.status
+                .set_text(&format!("could not open Properties: {}", e.message()));
             return;
         }
     };
@@ -810,7 +858,8 @@ fn show_properties(ui: &Rc<Ui>) {
         None::<&gio::Cancellable>,
         move |res| {
             if let Err(e) = res {
-                ui2.status.set_text(&format!("could not open Properties: {}", e.message()));
+                ui2.status
+                    .set_text(&format!("could not open Properties: {}", e.message()));
             }
         },
     );
@@ -819,14 +868,21 @@ fn show_properties(ui: &Rc<Ui>) {
 /// Moves the selected file to the desktop trash (recoverable), and drops the
 /// row. The daemon sees the move through fanotify on its own.
 fn trash_selected(ui: &Ui) {
-    let Some((_, iter)) = ui.tree.selection().selected() else { return };
-    let Some(path) = path_at(ui, &iter) else { return };
+    let Some((_, iter)) = ui.tree.selection().selected() else {
+        return;
+    };
+    let Some(path) = path_at(ui, &iter) else {
+        return;
+    };
     match gio::File::for_path(&path).trash(None::<&gio::Cancellable>) {
         Ok(()) => {
             ui.store.remove(&iter);
-            ui.status.set_text(&format!("moved to trash: {}", path.display()));
+            ui.status
+                .set_text(&format!("moved to trash: {}", path.display()));
         }
-        Err(e) => ui.status.set_text(&format!("could not move to trash: {}", e.message())),
+        Err(e) => ui
+            .status
+            .set_text(&format!("could not move to trash: {}", e.message())),
     }
 }
 

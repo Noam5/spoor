@@ -10,8 +10,8 @@
 //!    overflow ever is reported, we say so loudly rather than going quietly
 //!    stale.
 
-mod index;
 mod gui;
+mod index;
 mod ipc;
 mod krunner;
 mod persist;
@@ -89,7 +89,8 @@ fn main() {
                     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
                     for h in hits {
                         let _ = std::io::Write::write_all(&mut out, &h);
-                        let _ = std::io::Write::write_all(&mut out, if null { b"\0" } else { b"\n" });
+                        let _ =
+                            std::io::Write::write_all(&mut out, if null { b"\0" } else { b"\n" });
                     }
                 }
                 Err(e) => {
@@ -116,8 +117,11 @@ fn main() {
             // Measures server-side round-trip only: one process, one connection
             // per query, no process spawn or dynamic-linking cost in the number.
             let sock = arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string());
-            let n: usize = arg_value(&args, "--n").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let opts = SearchOpts::from_flags(&arg_value(&args, "--opts").unwrap_or_else(|| "-".into()));
+            let n: usize = arg_value(&args, "--n")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let opts =
+                SearchOpts::from_flags(&arg_value(&args, "--opts").unwrap_or_else(|| "-".into()));
             for pat in positionals(&args) {
                 if let Err(e) = query::search(&sock, pat, 100, &opts) {
                     println!("  {:<24} error: {}", pat, e);
@@ -126,7 +130,9 @@ fn main() {
                 let t0 = Instant::now();
                 let mut hits = 0;
                 for _ in 0..n {
-                    hits = query::search(&sock, pat, 100, &opts).map(|v| v.len()).unwrap_or(0);
+                    hits = query::search(&sock, pat, 100, &opts)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
                 }
                 let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
                 println!("  {:<24} {:7.2} ms   ({} hits)", pat, per, hits);
@@ -142,7 +148,9 @@ fn main() {
             eprintln!("  spoor daemon [--root /home] [--socket PATH] [--state PATH]");
             eprintln!("                     [--save-interval SECS] [--duration SECS] [--no-watch]");
             eprintln!("                     [--rescan PATH]... [--rescan-interval SECS]");
-            eprintln!("                     [--reconcile-interval SECS]  (default 86400, 0 = never)");
+            eprintln!(
+                "                     [--reconcile-interval SECS]  (default 86400, 0 = never)"
+            );
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
             eprintln!("                        [--files|--folders] [--no-hidden] [--null]");
             eprintln!("  spoor stats");
@@ -157,8 +165,17 @@ fn main() {
 
 /// Flags that consume the following argument; any other "--x" is a switch.
 const VALUE_FLAGS: &[&str] = &[
-    "--socket", "--limit", "--n", "--root", "--state", "--save-interval", "--duration", "--opts",
-    "--rescan", "--rescan-interval", "--reconcile-interval",
+    "--socket",
+    "--limit",
+    "--n",
+    "--root",
+    "--state",
+    "--save-interval",
+    "--duration",
+    "--opts",
+    "--rescan",
+    "--rescan-interval",
+    "--reconcile-interval",
 ];
 
 /// Every value of a repeatable flag.
@@ -188,9 +205,14 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
+// One parameter per command-line flag, and one caller: a struct would only
+// rename them.
+#[allow(clippy::too_many_arguments)]
 fn daemon(
     root: &str,
     sock: &str,
@@ -455,7 +477,10 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, lis
             match scan::walk_foreign(p) {
                 scan::ForeignWalk::Unavailable(why) => {
                     all_ok = false;
-                    eprintln!("spoor: rescan {}: unavailable ({}), retrying in {}s", p, why, RETRY);
+                    eprintln!(
+                        "spoor: rescan {}: unavailable ({}), retrying in {}s",
+                        p, why, RETRY
+                    );
                 }
                 scan::ForeignWalk::Listed(list, errors) => {
                     let walk_s = t0.elapsed().as_secs_f64();
@@ -489,7 +514,11 @@ fn rescan_loop(index: Arc<RwLock<Index>>, paths: Vec<String>, interval: u64, lis
                 }
             }
         }
-        let wait = if all_ok { interval } else { RETRY.min(interval) };
+        let wait = if all_ok {
+            interval
+        } else {
+            RETRY.min(interval)
+        };
         for _ in 0..wait {
             if stopping() {
                 return;
@@ -542,7 +571,9 @@ fn apply(ix: &mut Index, ev: &watch::Event) {
             full.push(b'/');
         }
         full.extend_from_slice(&ev.name);
-        let full = std::path::PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(full));
+        let full = std::path::PathBuf::from(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(full),
+        );
         let ino = std::fs::symlink_metadata(&full)
             .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
             .unwrap_or(0);
@@ -568,15 +599,23 @@ fn selftest(root: &str) {
     }
     let mut watcher = match watch::Watcher::new(root) {
         Ok(w) => w,
-        Err(e) => { eprintln!("selftest: watch failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("selftest: watch failed: {}", e);
+            std::process::exit(1);
+        }
     };
     println!("[1] fanotify: ONE filesystem-wide mark on {}", root);
 
     let t0 = Instant::now();
     let mut ix = Index::new();
     let st = scan::scan(&mut ix, root);
-    println!("[2] initial walk: {} files + {} dirs in {:.1}s ({} unreadable)",
-             st.files, st.dirs, t0.elapsed().as_secs_f64(), st.errors);
+    println!(
+        "[2] initial walk: {} files + {} dirs in {:.1}s ({} unreadable)",
+        st.files,
+        st.dirs,
+        t0.elapsed().as_secs_f64(),
+        st.errors
+    );
 
     let marker = format!("spoor-selftest-{}", unsafe { libc::getpid() });
     let base = format!("{}/.spoor-selftest", root.trim_end_matches('/'));
@@ -591,22 +630,31 @@ fn selftest(root: &str) {
     let deadline = Instant::now() + std::time::Duration::from_secs(8);
     let mut applied = 0usize;
     while Instant::now() < deadline {
-        if !watcher.wait(300) { continue; }
+        if !watcher.wait(300) {
+            continue;
+        }
         if let Ok(events) = watcher.read_events() {
             for ev in &events {
-                apply(&mut ix, ev); applied += 1;
+                apply(&mut ix, ev);
+                applied += 1;
             }
         }
     }
     let unresolved = UNRESOLVED.load(std::sync::atomic::Ordering::Relaxed);
-    println!("[4] applied {} live events ({} could not resolve a parent, {} handle failures)",
-             applied, unresolved,
-             watch::HANDLE_FAILURES.load(std::sync::atomic::Ordering::Relaxed));
+    println!(
+        "[4] applied {} live events ({} could not resolve a parent, {} handle failures)",
+        applied,
+        unresolved,
+        watch::HANDLE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     let hits = ix.search(&marker, 10);
     let lower = ix.search(&marker.to_uppercase(), 10);
     println!("[5] search(\"{}\") -> {:?}", marker, hits);
-    println!("[6] case-insensitive (uppercased query) -> {} hit(s)", lower.len());
+    println!(
+        "[6] case-insensitive (uppercased query) -> {} hit(s)",
+        lower.len()
+    );
 
     let _ = std::fs::remove_dir_all(base);
     if hits.len() == 1 && lower.len() == 1 {

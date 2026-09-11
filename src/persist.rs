@@ -58,7 +58,10 @@ pub fn load(path: &str) -> io::Result<Index> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad snapshot magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad snapshot magic",
+        ));
     }
     let mut buf8 = [0u8; 8];
     r.read_exact(&mut buf8)?;
@@ -81,6 +84,7 @@ pub fn load(path: &str) -> io::Result<Index> {
         r.read_exact(&mut namebuf)?;
         entries.push(Entry {
             parent,
+            ascii: namebuf.is_ascii(),
             name: namebuf.clone().into_boxed_slice(),
             is_dir: fb[0] & 1 != 0,
             alive: fb[0] & 2 != 0,
@@ -116,11 +120,14 @@ mod tests {
         let r = ix.add(NO_PARENT, "/tmp", true, 1);
         ix.set_root(r);
         ix.add(r, &b"caf\xe9"[..], false, 2);
+        ix.add(r, "ÉTÉ.txt", false, 3);
         let path = format!("/tmp/spoor-raw-test-{}.bin", std::process::id());
         save(&ix, &path).unwrap();
         let back = load(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(back.search_raw("caf", 10), vec![b"/tmp/caf\xe9".to_vec()]);
+        // the ascii flag is recomputed on load, so folding still applies
+        assert_eq!(back.search("été", 10), vec!["/tmp/ÉTÉ.txt"]);
     }
 
     #[test]

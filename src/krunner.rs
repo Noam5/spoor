@@ -26,7 +26,14 @@ pub struct Runner {
     pub socket: String,
 }
 
-type Match = (String, String, String, i32, f64, HashMap<String, Value<'static>>);
+type Match = (
+    String,
+    String,
+    String,
+    i32,
+    f64,
+    HashMap<String, Value<'static>>,
+);
 
 impl Runner {
     fn query(&self, pattern: &str, limit: usize) -> Vec<Vec<u8>> {
@@ -68,7 +75,9 @@ impl Runner {
             .into_iter()
             .map(|raw| {
                 let uri = file_uri(&raw);
-                let path = String::from_utf8_lossy(&raw);
+                // Display text only; the URI carries the real bytes. A newline
+                // would break KRunner's one-line layout, so show a symbol.
+                let path = String::from_utf8_lossy(&raw).replace('\n', "\u{23CE}");
                 let name = path.rsplit('/').next().unwrap_or(&path).to_string();
                 let parent = path
                     .rfind('/')

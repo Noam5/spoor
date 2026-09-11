@@ -25,7 +25,11 @@ pub struct ScanStats {
 /// `DirEntry::ino()` reads d_ino straight from the dirent, so the common path
 /// costs no stat at all.
 pub fn scan(index: &mut Index, root: &str) -> ScanStats {
-    let mut stats = ScanStats { files: 0, dirs: 0, errors: 0 };
+    let mut stats = ScanStats {
+        files: 0,
+        dirs: 0,
+        errors: 0,
+    };
 
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
@@ -218,7 +222,11 @@ mod tests {
             let hits = ix.search_raw(q, 10);
             assert_eq!(hits.len(), 1, "query {:?}", q);
             // the raw path opens the real file; a lossy copy would not
-            assert!(fs::metadata(OsStr::from_bytes(&hits[0])).is_ok(), "query {:?}", q);
+            assert!(
+                fs::metadata(OsStr::from_bytes(&hits[0])).is_ok(),
+                "query {:?}",
+                q
+            );
         }
         fs::remove_dir_all(&base).unwrap();
     }

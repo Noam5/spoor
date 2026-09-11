@@ -34,7 +34,7 @@ pub struct SearchOpts {
 }
 
 impl SearchOpts {
-    pub fn to_flags(&self) -> String {
+    pub fn to_flags(self) -> String {
         let mut s = String::new();
         if self.match_case {
             s.push('c');
@@ -122,13 +122,19 @@ impl Postings {
         }
         self.last = id;
         self.len += 1;
-        if self.len % SKIP_INTERVAL == 0 {
+        if self.len.is_multiple_of(SKIP_INTERVAL) {
             self.skips.push((id, self.bytes.len() as u32));
         }
     }
 
     fn iter(&self) -> PostingsIter<'_> {
-        PostingsIter { bytes: &self.bytes, pos: 0, acc: 0, first: true, pending: None }
+        PostingsIter {
+            bytes: &self.bytes,
+            pos: 0,
+            acc: 0,
+            first: true,
+            pending: None,
+        }
     }
 
     /// Last checkpoint at or before `target`, or None if it precedes the first.
@@ -212,6 +218,10 @@ pub struct Entry {
     pub name: Box<[u8]>,
     pub is_dir: bool,
     pub alive: bool,
+    /// The name is pure ASCII, fixed at insertion, so case-insensitive checks
+    /// on the vast majority of names skip folding without scanning for it.
+    /// Free in memory: it fits in the struct's padding.
+    pub ascii: bool,
 }
 
 pub struct Index {
@@ -296,6 +306,7 @@ impl Index {
         self.entries.push(Entry {
             parent,
             name: name.into(),
+            ascii: name.is_ascii(),
             is_dir,
             alive: true,
         });
@@ -504,7 +515,7 @@ impl Index {
                 return out; // a needle trigram is absent: nothing can match
             };
             for id in cands {
-                if contains(&self.entries[id as usize].name, needle, cs) && self.accept(id, o) {
+                if name_contains(&self.entries[id as usize], needle, cs) && self.accept(id, o) {
                     out.push(self.path_bytes(id));
                     if out.len() >= limit {
                         break;
@@ -514,7 +525,7 @@ impl Index {
             return out;
         }
         for (i, e) in self.entries.iter().enumerate() {
-            if contains(&e.name, needle, cs) && self.accept(i as u32, o) {
+            if name_contains(e, needle, cs) && self.accept(i as u32, o) {
                 out.push(self.path_bytes(i as u32));
                 if out.len() >= limit {
                     break;
@@ -566,7 +577,12 @@ impl Index {
     ///
     /// Returns None when the last segment is too short for a trigram (or there
     /// is no trigram index); the caller then falls back to the KMP pass.
-    fn search_path_trigram(&self, needle: &str, limit: usize, o: &SearchOpts) -> Option<Vec<Vec<u8>>> {
+    fn search_path_trigram(
+        &self,
+        needle: &str,
+        limit: usize,
+        o: &SearchOpts,
+    ) -> Option<Vec<Vec<u8>>> {
         let (anchors, strict) = self.path_anchors(needle, o.match_case)?;
         let flagged: Vec<(u32, bool)> = anchors.into_iter().map(|a| (a, !strict)).collect();
         Some(self.emit_anchored(&flagged, limit, o, &[]))
@@ -647,7 +663,10 @@ impl Index {
                 seen[cur as usize] = true;
                 // Below the anchor, prune hidden entries rather than walking
                 // into a dot-directory only to reject everything inside it.
-                if o.hide_hidden && cur != a && self.entries[cur as usize].name.first() == Some(&b'.') {
+                if o.hide_hidden
+                    && cur != a
+                    && self.entries[cur as usize].name.first() == Some(&b'.')
+                {
                     continue;
                 }
                 if (include_self || cur != a) && self.passes_kind(cur, o) {
@@ -716,7 +735,7 @@ impl Index {
                 hits.extend(
                     cands
                         .into_iter()
-                        .filter(|&id| contains(&self.entries[id as usize].name, t, cs)),
+                        .filter(|&id| name_contains(&self.entries[id as usize], t, cs)),
                 );
                 if hits.len() == before {
                     return Vec::new();
@@ -760,7 +779,7 @@ impl Index {
         while cur != NO_PARENT {
             let hit = match &term.set {
                 Some(set) => set.contains(&cur),
-                None => contains(&self.entries[cur as usize].name, term.text, cs),
+                None => name_contains(&self.entries[cur as usize], term.text, cs),
             };
             if hit {
                 if cur != h || !term.strict {
@@ -797,7 +816,11 @@ impl Index {
             let root = e.parent == NO_PARENT;
             let pi = e.parent as usize;
             let mut m = if root { 0 } else { mask[pi] };
-            let name = if ci { fold(&e.name) } else { Cow::Borrowed(&e.name[..]) };
+            let name = if ci && !e.ascii {
+                fold(&e.name)
+            } else {
+                Cow::Borrowed(&e.name[..])
+            };
             for t in 0..k {
                 let (p, f) = (pats[t], &fails[t]);
                 let mut st = if root { 0 } else { state[pi * k + t] as usize };
@@ -866,7 +889,11 @@ impl Index {
                 k = nk;
                 hit |= h;
             }
-            let name = if ci { fold(&e.name) } else { Cow::Borrowed(&e.name[..]) };
+            let name = if ci && !e.ascii {
+                fold(&e.name)
+            } else {
+                Cow::Borrowed(&e.name[..])
+            };
             for &b in name.iter() {
                 let c = if ci { b.to_ascii_lowercase() } else { b };
                 let (nk, h) = kmp_step(k, c, pat, &fail);
@@ -1029,6 +1056,21 @@ fn contains(haystack: &[u8], needle: impl AsRef<[u8]>, case_sensitive: bool) -> 
     }
 }
 
+/// `contains` for an entry's own name, using the ASCII flag fixed at insertion
+/// instead of scanning the name for it on every call -- this runs once per
+/// ancestor per hit in a multi-word query.
+#[inline]
+fn name_contains(e: &Entry, needle: impl AsRef<[u8]>, case_sensitive: bool) -> bool {
+    let needle = needle.as_ref();
+    if case_sensitive {
+        needle.is_empty() || e.name.windows(needle.len()).any(|w| w == needle)
+    } else if e.ascii {
+        contains_ascii_ci(&e.name, needle)
+    } else {
+        contains_ascii_ci(&fold(&e.name), needle)
+    }
+}
+
 /// Case-folds a name for case-insensitive matching: each character is
 /// lowercased on its own, so a folded name contains the folded needle whenever
 /// the name contains the needle. (str::to_lowercase has a context rule, the
@@ -1070,9 +1112,6 @@ fn for_each_trigram<F: FnMut(u32)>(b: &[u8], mut f: F) {
         f(key);
     }
 }
-
-
-
 
 /// Intersect a materialised sorted list against a compressed one.
 ///
@@ -1186,6 +1225,171 @@ fn contains_ascii_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
     false
 }
 
+impl Index {
+    /// Walk the tree by path components. Used when a fanotify event names a
+    /// directory whose inode we have not seen yet.
+    pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> Option<u32> {
+        let path = path.as_ref();
+        let cur0 = self.root;
+        if cur0 == NO_PARENT {
+            return None;
+        }
+        // The root entry stores its full mount path (e.g. "/home"), so strip
+        // that prefix before walking components.
+        let root_name: &[u8] = &self.entries[cur0 as usize].name;
+        let rest = if root_name == b"/" {
+            path
+        } else {
+            path.strip_prefix(root_name)?
+        };
+        let mut cur = cur0;
+        for comp in rest.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            cur = self.find_child(cur, comp)?;
+        }
+        Some(cur)
+    }
+
+    pub fn root_id(&self) -> u32 {
+        self.root
+    }
+
+    /// Every arena slot, dead ones included, for snapshotting.
+    pub fn raw_entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn raw_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Rebuild from a snapshot. `children` is derived from parent pointers;
+    /// `dir_ino` is intentionally left empty and is repopulated by the
+    /// reconciliation scan that runs at startup.
+    pub fn from_snapshot(entries: Vec<Entry>, root: u32) -> Index {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.parent != NO_PARENT {
+                children.entry(e.parent).or_default().push(i as u32);
+            }
+        }
+        Index {
+            entries,
+            dir_ino: HashMap::new(),
+            children,
+            root,
+            trigrams: HashMap::new(),
+            trigrams_built: false,
+        }
+    }
+}
+
+/// Outcome of grafting a rescanned mount into the index.
+pub struct GraftStats {
+    pub total: usize,
+    pub added: usize,
+    pub removed: usize,
+}
+
+impl Index {
+    /// Append an entry without registering its inode. Used for mounts that
+    /// are rescanned rather than watched: they are a different filesystem, so
+    /// their inode numbers would collide with the watched one's in `dir_ino`
+    /// and misroute fanotify events.
+    fn insert_foreign(&mut self, parent: u32, name: &[u8], is_dir: bool) -> u32 {
+        let id = self.entries.len() as u32;
+        if self.trigrams_built {
+            for_each_trigram(&fold(name), |key| {
+                self.trigrams.entry(key).or_default().push(id)
+            });
+        }
+        self.entries.push(Entry {
+            parent,
+            name: name.into(),
+            ascii: name.is_ascii(),
+            is_dir,
+            alive: true,
+        });
+        self.children.entry(parent).or_default().push(id);
+        id
+    }
+
+    /// Replace everything under `mount` with a fresh listing of it.
+    ///
+    /// For filesystems fanotify cannot watch -- an rclone FUSE mount of Google
+    /// Drive, whose remote changes never pass through the kernel -- a periodic
+    /// walk is the only source of truth. `walked` is pre-order
+    /// (parent, name, is_dir): parent indexes an earlier element, or is
+    /// NO_PARENT for the mount's own children.
+    ///
+    /// Entries still present are revived in place rather than re-created, so
+    /// repeated rescans do not grow the arena; vanished ones just stay dead.
+    /// `remove()` is deliberately not used: it prunes `dir_ino` per directory,
+    /// which is quadratic across 26k directories.
+    pub fn graft<N: AsRef<[u8]>>(&mut self, mount: u32, walked: &[(u32, N, bool)]) -> GraftStats {
+        let mut was_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut stack: Vec<u32> = self.children.get(&mount).cloned().unwrap_or_default();
+        while let Some(id) = stack.pop() {
+            let e = &mut self.entries[id as usize];
+            if e.alive {
+                was_alive.insert(id);
+            }
+            e.alive = false;
+            if let Some(kids) = self.children.get(&id) {
+                stack.extend(kids.iter().copied());
+            }
+        }
+
+        let mut ids: Vec<u32> = Vec::with_capacity(walked.len());
+        let mut lookups: HashMap<u32, HashMap<Box<[u8]>, u32>> = HashMap::new();
+        let (mut added, mut unchanged) = (0usize, 0usize);
+        for (parent_local, name, is_dir) in walked {
+            let parent = if *parent_local == NO_PARENT {
+                mount
+            } else {
+                ids[*parent_local as usize]
+            };
+            let existing = lookups
+                .entry(parent)
+                .or_insert_with(|| {
+                    self.children
+                        .get(&parent)
+                        .map(|v| {
+                            v.iter()
+                                .map(|&k| (self.entries[k as usize].name.clone(), k))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .get(name.as_ref())
+                .copied();
+            let id = match existing {
+                Some(k) => {
+                    let e = &mut self.entries[k as usize];
+                    e.alive = true;
+                    e.is_dir = *is_dir;
+                    if was_alive.contains(&k) {
+                        unchanged += 1;
+                    } else {
+                        added += 1;
+                    }
+                    k
+                }
+                None => {
+                    added += 1;
+                    self.insert_foreign(parent, name.as_ref(), *is_dir)
+                }
+            };
+            ids.push(id);
+        }
+        self.entries[mount as usize].alive = true;
+        GraftStats {
+            total: walked.len(),
+            added,
+            removed: was_alive.len() - unchanged,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,7 +1430,9 @@ mod tests {
         // "/home/alice" contains "home/alice", and so does everything beneath it
         let (ix, _) = sample();
         let hits = ix.search("home/alice", 10);
-        assert!(hits.iter().any(|h| h.ends_with("invoice-followup-T004821.txt")));
+        assert!(hits
+            .iter()
+            .any(|h| h.ends_with("invoice-followup-T004821.txt")));
     }
 
     #[test]
@@ -1243,7 +1449,10 @@ mod tests {
     #[test]
     fn path_query_is_case_insensitive() {
         let (ix, _) = sample();
-        assert_eq!(ix.search("HOME/ALICE", 10).len(), ix.search("home/alice", 10).len());
+        assert_eq!(
+            ix.search("HOME/ALICE", 10).len(),
+            ix.search("home/alice", 10).len()
+        );
         assert!(!ix.search("HOME/ALICE", 10).is_empty());
     }
 
@@ -1392,7 +1601,10 @@ mod tests {
     #[test]
     fn match_case_distinguishes_case() {
         let (ix, _) = sample();
-        let cs = SearchOpts { match_case: true, ..opts() };
+        let cs = SearchOpts {
+            match_case: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("T004821", 10, &cs).unwrap().len(), 1);
         assert_eq!(ix.search_opts("t004821", 10, &cs).unwrap().len(), 0);
         assert_eq!(ix.search_opts("t004821", 10, &opts()).unwrap().len(), 1);
@@ -1402,7 +1614,10 @@ mod tests {
     fn match_case_holds_with_trigrams_built() {
         let mut ix = varied();
         ix.build_trigrams();
-        let cs = SearchOpts { match_case: true, ..opts() };
+        let cs = SearchOpts {
+            match_case: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("INVOICE", 10, &cs).unwrap().len(), 1);
         assert_eq!(ix.search_opts("invoice", 10, &cs).unwrap().len(), 2);
         assert_eq!(ix.search_opts("invoice", 10, &opts()).unwrap().len(), 3);
@@ -1412,12 +1627,22 @@ mod tests {
     fn search_in_path_matches_descendants_without_a_slash() {
         let mut ix = tree();
         ix.build_trigrams();
-        let p = SearchOpts { in_path: true, ..opts() };
+        let p = SearchOpts {
+            in_path: true,
+            ..opts()
+        };
         // name mode: only the directory itself
-        assert_eq!(ix.search_opts("garden-analyze", 100, &opts()).unwrap().len(), 1);
+        assert_eq!(
+            ix.search_opts("garden-analyze", 100, &opts())
+                .unwrap()
+                .len(),
+            1
+        );
         // path mode: the directory and everything beneath it
         let hits = ix.search_opts("garden-analyze", 100, &p).unwrap();
-        assert!(hits.iter().any(|h| h.ends_with("invoice-followup-T004821.txt")));
+        assert!(hits
+            .iter()
+            .any(|h| h.ends_with("invoice-followup-T004821.txt")));
         assert_eq!(hits.len(), 7);
     }
 
@@ -1427,10 +1652,25 @@ mod tests {
         let mut tri = tree();
         tri.build_trigrams();
         for cs in [false, true] {
-            let o = SearchOpts { in_path: true, match_case: cs, ..opts() };
+            let o = SearchOpts {
+                in_path: true,
+                match_case: cs,
+                ..opts()
+            };
             for q in [
-                "garden", "suppliers", "alice", "ALICE", "src", "rs", "H10", "h10", "zzz",
-                "spoor", "workspace/garden", "SRC/spoor", "home",
+                "garden",
+                "suppliers",
+                "alice",
+                "ALICE",
+                "src",
+                "rs",
+                "H10",
+                "h10",
+                "zzz",
+                "spoor",
+                "workspace/garden",
+                "SRC/spoor",
+                "home",
             ] {
                 let mut a = plain.search_opts(q, 1000, &o).unwrap();
                 let mut b = tri.search_opts(q, 1000, &o).unwrap();
@@ -1445,18 +1685,34 @@ mod tests {
     fn regex_matches_names_and_paths() {
         let mut ix = tree();
         ix.build_trigrams();
-        let r = SearchOpts { regex: true, ..opts() };
-        assert_eq!(ix.search_opts(r"^invoice-.*\.txt$", 100, &r).unwrap().len(), 1);
+        let r = SearchOpts {
+            regex: true,
+            ..opts()
+        };
+        assert_eq!(
+            ix.search_opts(r"^invoice-.*\.txt$", 100, &r).unwrap().len(),
+            1
+        );
         // case-insensitive unless Match Case is on
         assert_eq!(ix.search_opts(r"^INVOICE-", 100, &r).unwrap().len(), 2);
-        let rc = SearchOpts { regex: true, match_case: true, ..opts() };
+        let rc = SearchOpts {
+            regex: true,
+            match_case: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts(r"^INVOICE-", 100, &rc).unwrap().len(), 0);
         // a '/' in the pattern matches against the whole path
         assert_eq!(
-            ix.search_opts(r"spoor/src/[a-z]+\.rs$", 100, &r).unwrap().len(),
+            ix.search_opts(r"spoor/src/[a-z]+\.rs$", 100, &r)
+                .unwrap()
+                .len(),
             4
         );
-        let rp = SearchOpts { regex: true, in_path: true, ..opts() };
+        let rp = SearchOpts {
+            regex: true,
+            in_path: true,
+            ..opts()
+        };
         assert_eq!(
             ix.search_opts(r"^/home/alice/src$", 100, &rp).unwrap(),
             vec!["/home/alice/src"]
@@ -1466,7 +1722,10 @@ mod tests {
     #[test]
     fn invalid_regex_is_an_error_not_a_panic() {
         let (ix, _) = sample();
-        let r = SearchOpts { regex: true, ..opts() };
+        let r = SearchOpts {
+            regex: true,
+            ..opts()
+        };
         let err = ix.search_opts("(unclosed", 10, &r).unwrap_err();
         assert!(err.starts_with("invalid regex"), "{}", err);
         assert!(!err.contains('\n'), "must fit the line protocol: {:?}", err);
@@ -1476,15 +1735,25 @@ mod tests {
     fn files_and_folders_filters() {
         let mut ix = tree();
         ix.build_trigrams();
-        let files = SearchOpts { kind: Kind::Files, ..opts() };
-        let folders = SearchOpts { kind: Kind::Folders, ..opts() };
+        let files = SearchOpts {
+            kind: Kind::Files,
+            ..opts()
+        };
+        let folders = SearchOpts {
+            kind: Kind::Folders,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("src", 100, &opts()).unwrap().len(), 2);
         assert_eq!(ix.search_opts("src", 100, &files).unwrap().len(), 0);
         assert_eq!(ix.search_opts("src", 100, &folders).unwrap().len(), 2);
         assert_eq!(ix.search_opts(".rs", 100, &files).unwrap().len(), 4);
         assert_eq!(ix.search_opts(".rs", 100, &folders).unwrap().len(), 0);
         // filters apply in path mode too, where descendants are emitted
-        let p_files = SearchOpts { kind: Kind::Files, in_path: true, ..opts() };
+        let p_files = SearchOpts {
+            kind: Kind::Files,
+            in_path: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("spoor", 100, &p_files).unwrap().len(), 4);
     }
 
@@ -1497,14 +1766,28 @@ mod tests {
         ix.add(cache, "notes-cache.txt", false, 51);
         ix.add(alice, ".notes-rc", false, 52);
         ix.build_trigrams();
-        let hide = SearchOpts { hide_hidden: true, ..opts() };
+        let hide = SearchOpts {
+            hide_hidden: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("notes", 100, &opts()).unwrap().len(), 3);
         assert_eq!(ix.search_opts("notes", 100, &hide).unwrap().len(), 1);
-        let path = SearchOpts { in_path: true, ..opts() };
-        let hide_path = SearchOpts { in_path: true, hide_hidden: true, ..opts() };
+        let path = SearchOpts {
+            in_path: true,
+            ..opts()
+        };
+        let hide_path = SearchOpts {
+            in_path: true,
+            hide_hidden: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("cache", 100, &path).unwrap().len(), 2);
         assert_eq!(ix.search_opts("cache", 100, &hide_path).unwrap().len(), 0);
-        let hide_regex = SearchOpts { regex: true, hide_hidden: true, ..opts() };
+        let hide_regex = SearchOpts {
+            regex: true,
+            hide_hidden: true,
+            ..opts()
+        };
         assert_eq!(ix.search_opts("notes", 100, &hide_regex).unwrap().len(), 1);
     }
 
@@ -1542,16 +1825,34 @@ mod tests {
             let mut tri = build();
             tri.build_trigrams();
             for q in [
-                "home/", "alice/", "/home/", "/home/alice/", "src/", "src/spoor/", "photos/",
-                "PHOTOS/", "photos-2024/", "oto/", "zzz/", "/home/alice/photos/", "ome/alice/pho",
+                "home/",
+                "alice/",
+                "/home/",
+                "/home/alice/",
+                "src/",
+                "src/spoor/",
+                "photos/",
+                "PHOTOS/",
+                "photos-2024/",
+                "oto/",
+                "zzz/",
+                "/home/alice/photos/",
+                "ome/alice/pho",
             ] {
                 for cs in [false, true] {
-                    let o = SearchOpts { match_case: cs, ..SearchOpts::default() };
+                    let o = SearchOpts {
+                        match_case: cs,
+                        ..SearchOpts::default()
+                    };
                     let mut a = plain.search_opts(q, 1000, &o).unwrap();
                     let mut b = tri.search_opts(q, 1000, &o).unwrap();
                     a.sort();
                     b.sort();
-                    assert_eq!(a, b, "root {:?} query {:?} case_sensitive={}", root_name, q, cs);
+                    assert_eq!(
+                        a, b,
+                        "root {:?} query {:?} case_sensitive={}",
+                        root_name, q, cs
+                    );
                 }
             }
         }
@@ -1568,23 +1869,29 @@ mod tests {
             v.iter().map(|(p, n, d)| (*p, n.to_string(), *d)).collect()
         };
 
-        let s1 = ix.graft(drive, &w(&[
-            (NO_PARENT, "photos", true),
-            (0, "IMG-1.jpg", false),
-            (0, "IMG-2.jpg", false),
-            (NO_PARENT, "notes.txt", false),
-        ]));
+        let s1 = ix.graft(
+            drive,
+            &w(&[
+                (NO_PARENT, "photos", true),
+                (0, "IMG-1.jpg", false),
+                (0, "IMG-2.jpg", false),
+                (NO_PARENT, "notes.txt", false),
+            ]),
+        );
         assert_eq!((s1.total, s1.added, s1.removed), (4, 4, 0));
         assert_eq!(ix.search("IMG-", 10).len(), 2);
         let arena = ix.raw_len();
 
         // IMG-2 deleted on the remote, IMG-3 added
-        let s2 = ix.graft(drive, &w(&[
-            (NO_PARENT, "photos", true),
-            (0, "IMG-1.jpg", false),
-            (0, "IMG-3.jpg", false),
-            (NO_PARENT, "notes.txt", false),
-        ]));
+        let s2 = ix.graft(
+            drive,
+            &w(&[
+                (NO_PARENT, "photos", true),
+                (0, "IMG-1.jpg", false),
+                (0, "IMG-3.jpg", false),
+                (NO_PARENT, "notes.txt", false),
+            ]),
+        );
         assert_eq!((s2.total, s2.added, s2.removed), (4, 1, 1));
         let mut hits = ix.search("IMG-", 10);
         hits.sort();
@@ -1595,7 +1902,11 @@ mod tests {
                 "/home/alice/GoogleDrive/photos/IMG-3.jpg"
             ]
         );
-        assert_eq!(ix.raw_len(), arena + 1, "unchanged entries are revived, not re-created");
+        assert_eq!(
+            ix.raw_len(),
+            arena + 1,
+            "unchanged entries are revived, not re-created"
+        );
         // the query that prompted this: a folder path with a trailing slash
         assert_eq!(ix.search("/home/alice/GoogleDrive/photos/", 10).len(), 2);
 
@@ -1627,7 +1938,10 @@ mod tests {
             assert_eq!(ix.search_raw("menu", 10), vec![raw.clone()]);
             assert_eq!(ix.search_raw("docs/caf", 10), vec![raw.clone()]);
             assert_eq!(ix.search_raw("docs menu", 10), vec![raw.clone()]);
-            assert_eq!(ix.search_raw("break", 10), vec![b"/data/docs/line\nbreak.txt".to_vec()]);
+            assert_eq!(
+                ix.search_raw("break", 10),
+                vec![b"/data/docs/line\nbreak.txt".to_vec()]
+            );
             // the display form replaces the stray byte; the raw form keeps it
             assert!(ix.search("menu", 10)[0].contains('\u{FFFD}'));
             let id = ix.resolve_path(&raw).expect("raw path resolves");
@@ -1657,12 +1971,24 @@ mod tests {
             assert_eq!(ix.search("/é", 10).len(), 3); // path, via the automaton
             assert_eq!(ix.search("école отчёт", 10), report); // several words
             assert_eq!(ix.search("/é φ", 10), sofia); // several short words
-            let cs = SearchOpts { match_case: true, ..Default::default() };
+            let cs = SearchOpts {
+                match_case: true,
+                ..Default::default()
+            };
             assert_eq!(ix.search_opts("Отчёт", 10, &cs).unwrap(), report);
             assert!(ix.search_opts("отчёт", 10, &cs).unwrap().is_empty());
-            let rx = SearchOpts { regex: true, ..Default::default() };
+            let rx = SearchOpts {
+                regex: true,
+                ..Default::default()
+            };
             assert_eq!(ix.search_opts("^σοφια", 10, &rx).unwrap(), sofia);
         }
+    }
+
+    #[test]
+    fn entry_stays_24_bytes() {
+        // 2.5M of them: the ascii flag must live in padding
+        assert_eq!(std::mem::size_of::<Entry>(), 24);
     }
 
     #[test]
@@ -1676,8 +2002,14 @@ mod tests {
     fn query_splitting() {
         assert_eq!(split_terms("a b"), vec!["a", "b"]);
         assert_eq!(split_terms("  a   b  "), vec!["a", "b"]);
-        assert_eq!(split_terms("\"wedding 2019\" notes"), vec!["wedding 2019", "notes"]);
-        assert_eq!(split_terms("\"unterminated phrase"), vec!["unterminated phrase"]);
+        assert_eq!(
+            split_terms("\"wedding 2019\" notes"),
+            vec!["wedding 2019", "notes"]
+        );
+        assert_eq!(
+            split_terms("\"unterminated phrase"),
+            vec!["unterminated phrase"]
+        );
         assert!(split_terms("\"\"").is_empty());
     }
 
@@ -1708,7 +2040,13 @@ mod tests {
     fn reference(ix: &Index, q: &str, o: &SearchOpts) -> Vec<String> {
         let terms: Vec<String> = split_terms(q)
             .into_iter()
-            .map(|t| if o.match_case { t } else { t.to_ascii_lowercase() })
+            .map(|t| {
+                if o.match_case {
+                    t
+                } else {
+                    t.to_ascii_lowercase()
+                }
+            })
             .collect();
         let mut out = Vec::new();
         for i in 0..ix.raw_len() as u32 {
@@ -1716,7 +2054,11 @@ mod tests {
                 continue;
             }
             let p = ix.path_of(i);
-            let hay = if o.match_case { p.clone() } else { p.to_ascii_lowercase() };
+            let hay = if o.match_case {
+                p.clone()
+            } else {
+                p.to_ascii_lowercase()
+            };
             if terms.iter().all(|t| hay.contains(t.as_str())) {
                 out.push(p);
             }
@@ -1728,18 +2070,49 @@ mod tests {
     #[test]
     fn multi_term_and_matches_brute_force_and_scan() {
         let queries = [
-            "wedding jpg", "jpg wedding", "invoice txt", "documents invoice", "photos/ jpg",
-            "photos/ wedding", "\"wedding 2019\" notes", "wedding 2019", "a b", "a/ b",
-            "invoice/ txt", "INVOICE txt", "zzz jpg", "txt invoice documents", "cache jpg",
-            "/home/ invoice", "home invoice", "hotos/wed jpg", "alpha beta", "jpg JPG",
+            "wedding jpg",
+            "jpg wedding",
+            "invoice txt",
+            "documents invoice",
+            "photos/ jpg",
+            "photos/ wedding",
+            "\"wedding 2019\" notes",
+            "wedding 2019",
+            "a b",
+            "a/ b",
+            "invoice/ txt",
+            "INVOICE txt",
+            "zzz jpg",
+            "txt invoice documents",
+            "cache jpg",
+            "/home/ invoice",
+            "home invoice",
+            "hotos/wed jpg",
+            "alpha beta",
+            "jpg JPG",
         ];
         let optsets = [
             SearchOpts::default(),
-            SearchOpts { match_case: true, ..SearchOpts::default() },
-            SearchOpts { kind: Kind::Files, ..SearchOpts::default() },
-            SearchOpts { kind: Kind::Folders, ..SearchOpts::default() },
-            SearchOpts { hide_hidden: true, ..SearchOpts::default() },
-            SearchOpts { in_path: true, ..SearchOpts::default() },
+            SearchOpts {
+                match_case: true,
+                ..SearchOpts::default()
+            },
+            SearchOpts {
+                kind: Kind::Files,
+                ..SearchOpts::default()
+            },
+            SearchOpts {
+                kind: Kind::Folders,
+                ..SearchOpts::default()
+            },
+            SearchOpts {
+                hide_hidden: true,
+                ..SearchOpts::default()
+            },
+            SearchOpts {
+                in_path: true,
+                ..SearchOpts::default()
+            },
         ];
         for root_name in ["/home", "/home/alice"] {
             let plain = words_tree(root_name);
@@ -1752,8 +2125,16 @@ mod tests {
                     let mut fast = tri.search_opts(q, 1000, o).unwrap();
                     scan.sort();
                     fast.sort();
-                    assert_eq!(scan, want, "scan: root {:?} query {:?} {:?}", root_name, q, o);
-                    assert_eq!(fast, want, "trigram: root {:?} query {:?} {:?}", root_name, q, o);
+                    assert_eq!(
+                        scan, want,
+                        "scan: root {:?} query {:?} {:?}",
+                        root_name, q, o
+                    );
+                    assert_eq!(
+                        fast, want,
+                        "trigram: root {:?} query {:?} {:?}",
+                        root_name, q, o
+                    );
                 }
             }
         }
@@ -1769,13 +2150,19 @@ mod tests {
         hits.sort();
         assert_eq!(
             hits,
-            vec!["/home/.cache/wedding-thumb.jpg", "/home/photos/wedding 2019/IMG-1.jpg"]
+            vec![
+                "/home/.cache/wedding-thumb.jpg",
+                "/home/photos/wedding 2019/IMG-1.jpg"
+            ]
         );
         // order does not matter
         let mut rev = ix.search("jpg wedding", 10);
         rev.sort();
         assert_eq!(rev, hits);
-        let visible = SearchOpts { hide_hidden: true, ..SearchOpts::default() };
+        let visible = SearchOpts {
+            hide_hidden: true,
+            ..SearchOpts::default()
+        };
         assert_eq!(
             ix.search_opts("wedding jpg", 10, &visible).unwrap(),
             vec!["/home/photos/wedding 2019/IMG-1.jpg"]
@@ -1793,8 +2180,19 @@ mod tests {
         let mut tri = varied();
         tri.build_trigrams();
         for q in [
-            "invoice", "INVOICE", "followup", "t004821", "T004821", ".txt", "watch",
-            "watcher", "rs", "ab", "zzz", "unrelated", "e-r",
+            "invoice",
+            "INVOICE",
+            "followup",
+            "t004821",
+            "T004821",
+            ".txt",
+            "watch",
+            "watcher",
+            "rs",
+            "ab",
+            "zzz",
+            "unrelated",
+            "e-r",
         ] {
             assert_eq!(
                 plain.search(q, 100),
@@ -1866,167 +2264,5 @@ mod tests {
             ix.search("deep-new-file", 10),
             vec!["/home/alice/a/b/deep-new-file.txt"]
         );
-    }
-}
-
-impl Index {
-    /// Walk the tree by path components. Used when a fanotify event names a
-    /// directory whose inode we have not seen yet.
-    pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> Option<u32> {
-        let path = path.as_ref();
-        let cur0 = self.root;
-        if cur0 == NO_PARENT {
-            return None;
-        }
-        // The root entry stores its full mount path (e.g. "/home"), so strip
-        // that prefix before walking components.
-        let root_name: &[u8] = &self.entries[cur0 as usize].name;
-        let rest = if root_name == b"/" {
-            path
-        } else {
-            path.strip_prefix(root_name)?
-        };
-        let mut cur = cur0;
-        for comp in rest.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
-            cur = self.find_child(cur, comp)?;
-        }
-        Some(cur)
-    }
-
-    pub fn root_id(&self) -> u32 {
-        self.root
-    }
-
-    /// Every arena slot, dead ones included, for snapshotting.
-    pub fn raw_entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
-    pub fn raw_len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Rebuild from a snapshot. `children` is derived from parent pointers;
-    /// `dir_ino` is intentionally left empty and is repopulated by the
-    /// reconciliation scan that runs at startup.
-    pub fn from_snapshot(entries: Vec<Entry>, root: u32) -> Index {
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (i, e) in entries.iter().enumerate() {
-            if e.parent != NO_PARENT {
-                children.entry(e.parent).or_default().push(i as u32);
-            }
-        }
-        Index {
-            entries,
-            dir_ino: HashMap::new(),
-            children,
-            root,
-            trigrams: HashMap::new(),
-            trigrams_built: false,
-        }
-    }
-}
-
-/// Outcome of grafting a rescanned mount into the index.
-pub struct GraftStats {
-    pub total: usize,
-    pub added: usize,
-    pub removed: usize,
-}
-
-impl Index {
-    /// Append an entry without registering its inode. Used for mounts that
-    /// are rescanned rather than watched: they are a different filesystem, so
-    /// their inode numbers would collide with the watched one's in `dir_ino`
-    /// and misroute fanotify events.
-    fn insert_foreign(&mut self, parent: u32, name: &[u8], is_dir: bool) -> u32 {
-        let id = self.entries.len() as u32;
-        if self.trigrams_built {
-            for_each_trigram(&fold(name), |key| self.trigrams.entry(key).or_default().push(id));
-        }
-        self.entries.push(Entry {
-            parent,
-            name: name.into(),
-            is_dir,
-            alive: true,
-        });
-        self.children.entry(parent).or_default().push(id);
-        id
-    }
-
-    /// Replace everything under `mount` with a fresh listing of it.
-    ///
-    /// For filesystems fanotify cannot watch -- an rclone FUSE mount of Google
-    /// Drive, whose remote changes never pass through the kernel -- a periodic
-    /// walk is the only source of truth. `walked` is pre-order
-    /// (parent, name, is_dir): parent indexes an earlier element, or is
-    /// NO_PARENT for the mount's own children.
-    ///
-    /// Entries still present are revived in place rather than re-created, so
-    /// repeated rescans do not grow the arena; vanished ones just stay dead.
-    /// `remove()` is deliberately not used: it prunes `dir_ino` per directory,
-    /// which is quadratic across 26k directories.
-    pub fn graft<N: AsRef<[u8]>>(&mut self, mount: u32, walked: &[(u32, N, bool)]) -> GraftStats {
-        let mut was_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut stack: Vec<u32> = self.children.get(&mount).cloned().unwrap_or_default();
-        while let Some(id) = stack.pop() {
-            let e = &mut self.entries[id as usize];
-            if e.alive {
-                was_alive.insert(id);
-            }
-            e.alive = false;
-            if let Some(kids) = self.children.get(&id) {
-                stack.extend(kids.iter().copied());
-            }
-        }
-
-        let mut ids: Vec<u32> = Vec::with_capacity(walked.len());
-        let mut lookups: HashMap<u32, HashMap<Box<[u8]>, u32>> = HashMap::new();
-        let (mut added, mut unchanged) = (0usize, 0usize);
-        for (parent_local, name, is_dir) in walked {
-            let parent = if *parent_local == NO_PARENT {
-                mount
-            } else {
-                ids[*parent_local as usize]
-            };
-            let existing = lookups
-                .entry(parent)
-                .or_insert_with(|| {
-                    self.children
-                        .get(&parent)
-                        .map(|v| {
-                            v.iter()
-                                .map(|&k| (self.entries[k as usize].name.clone(), k))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .get(name.as_ref())
-                .copied();
-            let id = match existing {
-                Some(k) => {
-                    let e = &mut self.entries[k as usize];
-                    e.alive = true;
-                    e.is_dir = *is_dir;
-                    if was_alive.contains(&k) {
-                        unchanged += 1;
-                    } else {
-                        added += 1;
-                    }
-                    k
-                }
-                None => {
-                    added += 1;
-                    self.insert_foreign(parent, name.as_ref(), *is_dir)
-                }
-            };
-            ids.push(id);
-        }
-        self.entries[mount as usize].alive = true;
-        GraftStats {
-            total: walked.len(),
-            added,
-            removed: was_alive.len() - unchanged,
-        }
     }
 }

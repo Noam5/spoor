@@ -87,8 +87,7 @@ impl Event {
     }
 }
 
-pub static HANDLE_FAILURES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub static HANDLE_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub struct Watcher {
     fd: RawFd,
@@ -116,7 +115,10 @@ impl Watcher {
                 Some(libc::EPERM) => " -- spoor needs CAP_SYS_ADMIN; run it as root",
                 _ => "",
             };
-            return Err(io::Error::new(e.kind(), format!("fanotify_init: {}{}", e, hint)));
+            return Err(io::Error::new(
+                e.kind(),
+                format!("fanotify_init: {}{}", e, hint),
+            ));
         }
 
         let cpath = std::ffi::CString::new(mount).unwrap();
@@ -143,7 +145,10 @@ impl Watcher {
                 }
                 _ => "",
             };
-            return Err(io::Error::new(e.kind(), format!("fanotify_mark {}: {}{}", mount, e, hint)));
+            return Err(io::Error::new(
+                e.kind(),
+                format!("fanotify_mark {}: {}{}", mount, e, hint),
+            ));
         }
 
         // Needed by open_by_handle_at to resolve handles back to paths.
@@ -167,7 +172,11 @@ impl Watcher {
 
     /// Wait up to `ms` for events. Returns true if some are ready.
     pub fn wait(&self, ms: i32) -> bool {
-        let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
     }
 
@@ -255,7 +264,7 @@ impl Watcher {
         } else {
             0
         };
-        let dev = st.st_dev as u64;
+        let dev = st.st_dev;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", dfd))
             .ok()
             .map(|p| std::os::unix::ffi::OsStringExt::into_vec(p.into_os_string()));
@@ -267,6 +276,10 @@ impl Watcher {
     }
 }
 
+/// Maps a file handle (and its offset in the read buffer, for the
+/// open_by_handle_at fallback) to an inode and, when known, its path.
+type Resolve<'a> = dyn Fn(&FileHandle, usize) -> (u64, Option<Vec<u8>>) + 'a;
+
 /// Decode a buffer of fanotify records.
 ///
 /// The records are variable-length and only 4-byte aligned, while the metadata
@@ -276,10 +289,7 @@ impl Watcher {
 /// runs as root; a malformed record is skipped, never read past. `resolve`
 /// turns a directory file handle (header copy, offset of the header in `buf`)
 /// into an inode and optional path.
-fn parse_events(
-    buf: &[u8],
-    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<Vec<u8>>),
-) -> Vec<Event> {
+fn parse_events(buf: &[u8], resolve: &Resolve<'_>) -> Vec<Event> {
     const META: usize = std::mem::size_of::<EventMetadata>();
     const HDR: usize = std::mem::size_of::<InfoHeader>();
     let total = buf.len();
@@ -335,7 +345,7 @@ fn decode_dfid_name(
     mask: u64,
     start: usize,
     end: usize,
-    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<Vec<u8>>),
+    resolve: &Resolve<'_>,
 ) -> Option<Event> {
     let fh_off = start + 4 + 8;
     if fh_off + 8 > end {
@@ -385,7 +395,7 @@ mod tests {
         info.extend_from_slice(payload);
         info.extend_from_slice(name);
         info.push(0);
-        while info.len() % 4 != 0 {
+        while !info.len().is_multiple_of(4) {
             info.push(0);
         }
         let ilen = info.len() as u16;
@@ -407,7 +417,12 @@ mod tests {
 
     #[test]
     fn decodes_a_create_event() {
-        let buf = record(FAN_CREATE | FAN_ONDIR, 1, &[7, 0, 0, 0, 9, 9, 9, 9], b"photos");
+        let buf = record(
+            FAN_CREATE | FAN_ONDIR,
+            1,
+            &[7, 0, 0, 0, 9, 9, 9, 9],
+            b"photos",
+        );
         let evs = parse_events(&buf, &by_type);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].name, b"photos".to_vec());
@@ -435,7 +450,12 @@ mod tests {
         buf.extend(record(FAN_CREATE, 1, &[1; 8], b"cut-off"));
         for cut in 0..buf.len() {
             let evs = parse_events(&buf[..cut], &by_type);
-            assert_eq!(evs.len(), if cut >= whole { 1 } else { 0 }, "cut at {}", cut);
+            assert_eq!(
+                evs.len(),
+                if cut >= whole { 1 } else { 0 },
+                "cut at {}",
+                cut
+            );
         }
     }
 
