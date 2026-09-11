@@ -70,8 +70,9 @@ pub struct Event {
     /// Inode of the directory containing the change.
     pub parent_ino: u64,
     /// Full path of that directory, resolved via the file handle.
-    pub parent_path: Option<String>,
-    pub name: String,
+    pub parent_path: Option<Vec<u8>>,
+    /// Raw bytes, exactly as the kernel reported them.
+    pub name: Vec<u8>,
 }
 
 impl Event {
@@ -196,7 +197,7 @@ impl Watcher {
     /// first 4 bytes of the payload, so the common case needs no syscall.
     /// open_by_handle_at is the fallback for other handle types; it is
     /// unverified beyond ext4 (it returned EBADF in early testing).
-    fn resolve_handle(&self, fh: &FileHandle, fh_off: usize) -> (u64, Option<String>) {
+    fn resolve_handle(&self, fh: &FileHandle, fh_off: usize) -> (u64, Option<Vec<u8>>) {
         // Formats that carry the inode in the clear (generic ext2/3/4 and xfs
         // encoders, native byte order). The caller has already checked that
         // handle_bytes of payload lie inside the record.
@@ -257,7 +258,7 @@ impl Watcher {
         let dev = st.st_dev as u64;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", dfd))
             .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+            .map(|p| std::os::unix::ffi::OsStringExt::into_vec(p.into_os_string()));
         unsafe { libc::close(dfd) };
         if ino == 0 || dev != self.root_dev {
             return (0, None); // another subvolume or filesystem: not indexed here
@@ -277,7 +278,7 @@ impl Watcher {
 /// into an inode and optional path.
 fn parse_events(
     buf: &[u8],
-    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<String>),
+    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<Vec<u8>>),
 ) -> Vec<Event> {
     const META: usize = std::mem::size_of::<EventMetadata>();
     const HDR: usize = std::mem::size_of::<InfoHeader>();
@@ -299,7 +300,7 @@ fn parse_events(
                 mask: meta.mask,
                 parent_ino: 0,
                 parent_path: None,
-                name: String::new(),
+                name: Vec::new(),
             });
             off = end;
             continue;
@@ -334,7 +335,7 @@ fn decode_dfid_name(
     mask: u64,
     start: usize,
     end: usize,
-    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<String>),
+    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<Vec<u8>>),
 ) -> Option<Event> {
     let fh_off = start + 4 + 8;
     if fh_off + 8 > end {
@@ -348,8 +349,8 @@ fn decode_dfid_name(
         return None;
     }
     let nul = buf[name_off..end].iter().position(|&b| b == 0)?;
-    let name = String::from_utf8_lossy(&buf[name_off..name_off + nul]).into_owned();
-    if name.is_empty() || name == "." {
+    let name = buf[name_off..name_off + nul].to_vec();
+    if name.is_empty() || name == b"." {
         return None;
     }
     let (ino, path) = resolve(&fh, fh_off);
@@ -400,7 +401,7 @@ mod tests {
         ev
     }
 
-    fn by_type(fh: &FileHandle, _off: usize) -> (u64, Option<String>) {
+    fn by_type(fh: &FileHandle, _off: usize) -> (u64, Option<Vec<u8>>) {
         (fh.handle_type as u64, None)
     }
 
@@ -409,7 +410,7 @@ mod tests {
         let buf = record(FAN_CREATE | FAN_ONDIR, 1, &[7, 0, 0, 0, 9, 9, 9, 9], b"photos");
         let evs = parse_events(&buf, &by_type);
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].name, "photos");
+        assert_eq!(evs[0].name, b"photos".to_vec());
         assert!(evs[0].is_dir() && evs[0].is_create());
         assert_eq!(evs[0].parent_ino, 1, "resolver saw the handle type");
     }
@@ -423,7 +424,7 @@ mod tests {
         buf.extend(record(FAN_DELETE, 1, &[2; 8], b"second"));
         let evs = parse_events(&buf, &by_type);
         assert_eq!(evs.len(), 2);
-        assert_eq!(evs[1].name, "second");
+        assert_eq!(evs[1].name, b"second".to_vec());
         assert!(evs[1].is_delete());
     }
 

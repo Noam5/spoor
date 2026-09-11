@@ -6,6 +6,11 @@
 //!                                        per SearchOpts::to_flags, "-" for none.
 //!                                        A line "ERR <message>" reports an error
 //!                                        (paths always start with '/').
+//!   SEARCH0 <limit> <flags> <pattern>\n -> the same, but each path is raw bytes
+//!                                        ended by NUL, the one byte a Linux path
+//!                                        cannot contain; an empty record ends
+//!                                        the reply. Use this: QUERY and SEARCH
+//!                                        cannot carry a name with a newline.
 //!   STATS\n                            -> "entries <n> arena <n>", blank line
 //!
 //! The daemon runs as root and indexes names that ordinary users may not list,
@@ -87,7 +92,7 @@ fn handle(stream: UnixStream, index: Arc<RwLock<Index>>) -> io::Result<()> {
         let mut parts = rest.splitn(2, ' ');
         let limit = parse_limit(parts.next());
         let pattern = parts.next().unwrap_or("");
-        let result = run_query(&index, &peer, filter, limit, |ix, n| Ok(ix.search(pattern, n)));
+        let result = run_query(&index, &peer, filter, limit, |ix, n| Ok(ix.search_raw(pattern, n)));
         reply(&mut writer, result)?;
     } else if let Some(rest) = line.strip_prefix("SEARCH ") {
         let mut parts = rest.splitn(3, ' ');
@@ -95,9 +100,18 @@ fn handle(stream: UnixStream, index: Arc<RwLock<Index>>) -> io::Result<()> {
         let opts = SearchOpts::from_flags(parts.next().unwrap_or("-"));
         let pattern = parts.next().unwrap_or("");
         let result = run_query(&index, &peer, filter, limit, |ix, n| {
-            ix.search_opts(pattern, n, &opts)
+            ix.search_opts_raw(pattern, n, &opts)
         });
         reply(&mut writer, result)?;
+    } else if let Some(rest) = line.strip_prefix("SEARCH0 ") {
+        let mut parts = rest.splitn(3, ' ');
+        let limit = parse_limit(parts.next());
+        let opts = SearchOpts::from_flags(parts.next().unwrap_or("-"));
+        let pattern = parts.next().unwrap_or("");
+        let result = run_query(&index, &peer, filter, limit, |ix, n| {
+            ix.search_opts_raw(pattern, n, &opts)
+        });
+        reply0(&mut writer, result)?;
     } else if line == "STATS" {
         let ix = index.read().unwrap();
         writeln!(writer, "entries {} arena {}", ix.len(), ix.capacity_used())?;
@@ -114,22 +128,40 @@ fn parse_limit(s: Option<&str>) -> usize {
     s.and_then(|v| v.parse().ok()).unwrap_or(100).min(MAX_LIMIT)
 }
 
-fn reply(w: &mut impl Write, result: Result<Vec<String>, String>) -> io::Result<()> {
+/// Line framing (QUERY, SEARCH). A file name may legally contain a newline,
+/// which would inject a fake result line here, so such paths are not sent;
+/// SEARCH0 carries them.
+fn reply(w: &mut impl Write, result: Result<Vec<Vec<u8>>, String>) -> io::Result<()> {
     match result {
         Ok(hits) => {
             for h in hits {
-                // A file name may legally contain a newline, which would inject
-                // a fake result line into this protocol. Until the protocol
-                // carries arbitrary bytes, such paths are not sent at all.
-                if h.contains(['\n', '\r']) {
+                if h.contains(&b'\n') || h.contains(&b'\r') {
                     continue;
                 }
-                writeln!(w, "{}", h)?;
+                w.write_all(&h)?;
+                w.write_all(b"\n")?;
             }
         }
         Err(e) => writeln!(w, "ERR {}", e)?,
     }
     writeln!(w)
+}
+
+/// NUL framing (SEARCH0): every path, whatever its bytes; an empty record ends.
+fn reply0(w: &mut impl Write, result: Result<Vec<Vec<u8>>, String>) -> io::Result<()> {
+    match result {
+        Ok(hits) => {
+            for h in hits {
+                w.write_all(&h)?;
+                w.write_all(b"\0")?;
+            }
+        }
+        Err(e) => {
+            w.write_all(format!("ERR {}", e).as_bytes())?;
+            w.write_all(b"\0")?;
+        }
+    }
+    w.write_all(b"\0")
 }
 
 /// Run a search and, when filtering, keep only what the peer may see. Results
@@ -140,13 +172,13 @@ fn run_query(
     peer: &Peer,
     filter: bool,
     limit: usize,
-    search: impl Fn(&Index, usize) -> Result<Vec<String>, String>,
-) -> Result<Vec<String>, String> {
+    search: impl Fn(&Index, usize) -> Result<Vec<Vec<u8>>, String>,
+) -> Result<Vec<Vec<u8>>, String> {
     if !filter {
         let ix = index.read().unwrap();
         return search(&ix, limit);
     }
-    let mut cache: HashMap<String, bool> = HashMap::new();
+    let mut cache: HashMap<Vec<u8>, bool> = HashMap::new();
     let mut window = limit.max(1);
     loop {
         let hits = {
@@ -167,10 +199,10 @@ fn run_query(
 /// Keep the paths whose containing directory passes `can_list`, asking at most
 /// once per directory.
 fn keep_visible(
-    hits: Vec<String>,
-    cache: &mut HashMap<String, bool>,
-    can_list: impl Fn(&str) -> bool,
-) -> Vec<String> {
+    hits: Vec<Vec<u8>>,
+    cache: &mut HashMap<Vec<u8>, bool>,
+    can_list: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
     hits.into_iter()
         .filter(|p| {
             let dir = parent_dir(p);
@@ -178,22 +210,22 @@ fn keep_visible(
                 return v;
             }
             let v = can_list(dir);
-            cache.insert(dir.to_string(), v);
+            cache.insert(dir.to_vec(), v);
             v
         })
         .collect()
 }
 
-fn parent_dir(p: &str) -> &str {
-    match p.rfind('/') {
-        Some(0) | None => "/",
+fn parent_dir(p: &[u8]) -> &[u8] {
+    match p.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => b"/",
         Some(i) => &p[..i],
     }
 }
 
 /// Could the current thread's filesystem identity list `dir`? Asks the kernel
 /// directly (faccessat2 with AT_EACCESS), so ACLs and LSMs are honoured.
-fn listable(dir: &str) -> bool {
+fn listable(dir: &[u8]) -> bool {
     let Ok(c) = CString::new(dir) else {
         return false;
     };
@@ -324,6 +356,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn b(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
     #[test]
     fn peer_credentials_come_from_the_socket() {
         let (a, _b) = UnixStream::pair().unwrap();
@@ -350,33 +386,33 @@ mod tests {
         std::fs::create_dir_all(&open).unwrap();
         std::fs::create_dir_all(&shut).unwrap();
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(listable(open.to_str().unwrap()));
-        assert!(!listable(shut.to_str().unwrap()));
+        assert!(listable(open.to_str().unwrap().as_bytes()));
+        assert!(!listable(shut.to_str().unwrap().as_bytes()));
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn filtering_asks_once_per_directory_and_keeps_order() {
-        let hits: Vec<String> = ["/pub/a", "/priv/b", "/pub/c", "/priv/d", "/pub/sub/e"]
+        let hits: Vec<Vec<u8>> = ["/pub/a", "/priv/b", "/pub/c", "/priv/d", "/pub/sub/e"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| b(s))
             .collect();
         let asked = std::cell::RefCell::new(Vec::new());
         let mut cache = HashMap::new();
         let kept = keep_visible(hits, &mut cache, |d| {
-            asked.borrow_mut().push(d.to_string());
-            !d.starts_with("/priv")
+            asked.borrow_mut().push(d.to_vec());
+            !d.starts_with(b"/priv")
         });
-        assert_eq!(kept, vec!["/pub/a", "/pub/c", "/pub/sub/e"]);
-        assert_eq!(*asked.borrow(), vec!["/pub", "/priv", "/pub/sub"]);
+        assert_eq!(kept, vec![b("/pub/a"), b("/pub/c"), b("/pub/sub/e")]);
+        assert_eq!(*asked.borrow(), vec![b("/pub"), b("/priv"), b("/pub/sub")]);
     }
 
     #[test]
     fn parents_of_top_level_entries() {
-        assert_eq!(parent_dir("/home"), "/");
-        assert_eq!(parent_dir("/home/alice/x"), "/home/alice");
-        assert_eq!(parent_dir("/"), "/");
+        assert_eq!(parent_dir(b"/home"), b"/");
+        assert_eq!(parent_dir(b"/home/alice/x"), b"/home/alice");
+        assert_eq!(parent_dir(b"/"), b"/");
     }
 
     #[test]
@@ -393,9 +429,23 @@ mod tests {
     }
 
     #[test]
-    fn newline_paths_are_never_sent() {
+    fn line_framing_never_sends_a_newline_path() {
         let mut out = Vec::new();
-        reply(&mut out, Ok(vec!["/a".into(), "/evil\n/etc/shadow".into(), "/b".into()])).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "/a\n/b\n\n");
+        reply(&mut out, Ok(vec![b("/a"), b("/evil\n/etc/shadow"), b("/b")])).unwrap();
+        assert_eq!(out, b"/a\n/b\n\n");
+    }
+
+    #[test]
+    fn nul_framing_carries_any_bytes() {
+        let mut out = Vec::new();
+        let odd = b"/x/line\nbreak/caf\xe9".to_vec();
+        reply0(&mut out, Ok(vec![b("/a"), odd.clone()])).unwrap();
+        let mut want = b"/a\0".to_vec();
+        want.extend_from_slice(&odd);
+        want.extend_from_slice(b"\0\0");
+        assert_eq!(out, want);
+        let mut err = Vec::new();
+        reply0(&mut err, Err("invalid regex: x".into())).unwrap();
+        assert_eq!(err, b"ERR invalid regex: x\0\0");
     }
 }

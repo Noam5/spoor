@@ -6,6 +6,10 @@
 //! A thin client: it holds no index of its own and queries the daemon over
 //! /run/spoor.sock. Closing it cannot invalidate anything -- which is the whole
 //! point of keeping the index in a daemon.
+//!
+//! Paths stay raw bytes from the socket to xdg-open: a Linux file name need not
+//! be UTF-8, and a GTK string column would mangle it, so the store holds only
+//! display text plus an index into `Ui::paths`.
 
 use crate::index::{Kind, SearchOpts};
 use gtk::gio;
@@ -17,17 +21,24 @@ use gtk::{
     ListStore, Menu, MenuBar, MenuItem, Orientation, PolicyType, RadioMenuItem, ResponseType,
     ScrolledWindow, SeparatorMenuItem, SpinButton, TreeView, TreeViewColumn,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const COL_NAME: u32 = 0;
 const COL_PATH: u32 = 1;
 const COL_SIZE: u32 = 2;
 const COL_MODIFIED: u32 = 3;
-const COL_FULL: u32 = 4;
+/// The row's index into `Ui::paths`.
+const COL_ID: u32 = 4;
+/// Numeric sort keys behind Size and Modified; -1 for folders and for files
+/// that vanished, so those sort together at one end.
+const COL_SIZE_N: u32 = 5;
+const COL_MTIME_N: u32 = 6;
 
 /// Everything the user can set, persisted between runs.
 #[derive(Clone)]
@@ -118,6 +129,12 @@ struct Ui {
     socket: String,
     /// Debounce timer for search-as-you-type.
     pending: RefCell<Option<glib::SourceId>>,
+    /// Raw path bytes of the rows on display, indexed by COL_ID.
+    paths: RefCell<Vec<Vec<u8>>>,
+    /// Number of the latest search started, and of the latest one shown. A
+    /// worker's answer is dropped if a newer search has started since.
+    started: Cell<u64>,
+    shown: Cell<u64>,
 }
 
 pub fn run(socket_override: Option<String>, default_socket: &str) {
@@ -165,15 +182,24 @@ fn build(app: &Application, socket: String) {
     bar.pack_start(&open_folder, false, false, 0);
     root.pack_start(&bar, false, false, 0);
 
-    let store = ListStore::new(&[String::static_type(); 5]);
+    let store = ListStore::new(&[
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        u32::static_type(),
+        i64::static_type(),
+        i64::static_type(),
+    ]);
     let tree = TreeView::with_model(&store);
     tree.set_headers_visible(true);
     tree.set_fixed_height_mode(true);
-    for (title, col, width) in [
-        ("Name", COL_NAME, 320),
-        ("Path", COL_PATH, 420),
-        ("Size", COL_SIZE, 90),
-        ("Modified", COL_MODIFIED, 150),
+    // Click a header to sort; results arrive in index order until then.
+    for (title, col, sort, width) in [
+        ("Name", COL_NAME, COL_NAME, 320),
+        ("Path", COL_PATH, COL_PATH, 420),
+        ("Size", COL_SIZE, COL_SIZE_N, 90),
+        ("Modified", COL_MODIFIED, COL_MTIME_N, 150),
     ] {
         let r = CellRendererText::new();
         r.set_property("ellipsize", gtk::pango::EllipsizeMode::End);
@@ -184,6 +210,7 @@ fn build(app: &Application, socket: String) {
         c.set_resizable(true);
         c.set_sizing(gtk::TreeViewColumnSizing::Fixed);
         c.set_fixed_width(width);
+        c.set_sort_column_id(sort as i32);
         tree.append_column(&c);
     }
     let scroll = ScrolledWindow::builder()
@@ -211,6 +238,9 @@ fn build(app: &Application, socket: String) {
         settings: RefCell::new(Settings::load()),
         socket,
         pending: RefCell::new(None),
+        paths: RefCell::new(Vec::new()),
+        started: Cell::new(0),
+        shown: Cell::new(0),
     });
 
     build_menus(&ui, &menubar, &accel);
@@ -232,15 +262,14 @@ fn build(app: &Application, socket: String) {
         });
     }
     // Double-click or Enter anywhere on a row opens the file, whichever column.
-    tree.connect_row_activated(move |tv, path, _| {
-        let full = tv
-            .model()
-            .and_then(|m| m.iter(path).map(|it| m.value(&it, COL_FULL as i32)))
-            .and_then(|v| v.get::<String>().ok());
-        if let Some(full) = full {
-            open(&full);
-        }
-    });
+    {
+        let ui = ui.clone();
+        tree.connect_row_activated(move |_, path, _| {
+            if let Some(p) = ui.store.iter(path).and_then(|it| path_at(&ui, &it)) {
+                open(&p);
+            }
+        });
+    }
     {
         let menu = context.clone();
         tree.connect_button_press_event(move |tv, ev| {
@@ -497,15 +526,15 @@ fn set_opt(ui: &Rc<Ui>, f: impl FnOnce(&mut SearchOpts)) {
 
 // ---------------------------------------------------------------- search
 
-/// Search runs on the GTK main thread. Plain queries answer in well under a
-/// millisecond, but a regex is a full scan (~150ms on names, ~450ms on paths at
-/// 2.3M files), so searching on every keystroke would freeze the window once
-/// per letter. Wait for a pause in typing instead, longer when regex is on.
+/// Searches run on a worker thread, so a slow one (a regex is a full scan:
+/// ~150ms on names, ~450ms on paths at 2.3M files) never freezes the window.
+/// Waiting for a pause in typing still saves sending a query per keystroke
+/// that the next keystroke would supersede.
 fn schedule_search(ui: &Rc<Ui>) {
     cancel_pending(ui);
     let delay = if ui.settings.borrow().opts.regex { 300 } else { 40 };
     let ui2 = ui.clone();
-    let id = glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+    let id = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
         // Forget the id before running: removing a source that already fired
         // is an error in GLib.
         ui2.pending.borrow_mut().take();
@@ -520,55 +549,129 @@ fn cancel_pending(ui: &Ui) {
     }
 }
 
-fn run_search(ui: &Ui) {
+/// One result, with what the worker learnt from stat(): (is_dir, size, mtime).
+struct Row {
+    raw: Vec<u8>,
+    meta: Option<(bool, u64, i64)>,
+}
+
+fn run_search(ui: &Rc<Ui>) {
     let text = ui.entry.text().to_string();
-    let pattern = text.trim();
+    let pattern = text.trim().to_string();
     let s = ui.settings.borrow().clone();
-    let badges = badges(&s.opts);
-    ui.store.clear();
+    let seq = ui.started.get() + 1;
+    ui.started.set(seq);
     if pattern.is_empty() {
-        ui.status.set_text(&format!("type to search{}", badges));
+        ui.shown.set(seq);
+        clear_results(ui);
+        ui.status.set_text(&format!("type to search{}", badges(&s.opts)));
         return;
     }
 
-    let t0 = Instant::now();
-    let result = crate::query::search(&ui.socket, pattern, s.max_results as usize, &s.opts);
-    let elapsed = t0.elapsed();
-    let hits = match result {
-        Ok(h) => h,
+    // Say so only if the answer is slow in coming; saying it every time would
+    // flash in the status line on each keystroke.
+    {
+        let ui = ui.clone();
+        let badges = badges(&s.opts);
+        glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if ui.started.get() == seq && ui.shown.get() != seq {
+                ui.status.set_text(&format!("searching…{}", badges));
+            }
+        });
+    }
+
+    let socket = ui.socket.clone();
+    let ui = ui.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let limit = s.max_results as usize;
+        let opts = s.opts.clone();
+        let job = gio::spawn_blocking(move || {
+            let t0 = Instant::now();
+            let hits = crate::query::search(&socket, &pattern, limit, &opts);
+            let elapsed = t0.elapsed();
+            // stat() here too: up to 20,000 of them is real time on a cold cache.
+            let rows = hits.map(|hits| {
+                hits.into_iter()
+                    .map(|raw| {
+                        let meta = std::fs::symlink_metadata(OsStr::from_bytes(&raw))
+                            .ok()
+                            .map(|m| (m.is_dir(), m.size(), m.mtime()));
+                        Row { raw, meta }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (rows, elapsed)
+        });
+        let Ok((rows, elapsed)) = job.await else {
+            return;
+        };
+        if ui.started.get() != seq {
+            return; // superseded while it ran
+        }
+        ui.shown.set(seq);
+        show_results(&ui, rows, elapsed, &s);
+    });
+}
+
+fn clear_results(ui: &Ui) {
+    ui.store.clear();
+    ui.paths.borrow_mut().clear();
+}
+
+fn show_results(ui: &Ui, rows: Result<Vec<Row>, String>, elapsed: Duration, s: &Settings) {
+    let badges = badges(&s.opts);
+    let rows = match rows {
+        Ok(r) => r,
         Err(e) => {
+            clear_results(ui);
             ui.status.set_text(&format!("{}{}", e, badges));
             return;
         }
     };
-
-    for path in &hits {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let (size, modified) = match std::fs::symlink_metadata(path) {
-            Ok(m) if m.is_dir() => ("—".to_string(), fmt_time(m.mtime())),
-            Ok(m) => (fmt_size(m.size()), fmt_time(m.mtime())),
-            Err(_) => ("?".to_string(), String::new()),
-        };
-        ui.store.insert_with_values(
-            None,
-            &[
-                (COL_NAME, &name),
-                (COL_PATH, &parent_dir(path)),
-                (COL_SIZE, &size.as_str()),
-                (COL_MODIFIED, &modified.as_str()),
-                (COL_FULL, &path.as_str()),
-            ],
-        );
+    clear_results(ui);
+    // Detached, the view does not redraw per inserted row.
+    ui.tree.set_model(None::<&ListStore>);
+    let n = rows.len();
+    {
+        let mut paths = ui.paths.borrow_mut();
+        for row in rows {
+            let path = String::from_utf8_lossy(&row.raw);
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            let parent = match path.rfind('/') {
+                Some(0) | None => "/",
+                Some(i) => &path[..i],
+            };
+            let (size, size_n, modified, mtime_n) = match row.meta {
+                Some((true, _, t)) => ("—".to_string(), -1i64, fmt_time(t), t),
+                Some((false, len, t)) => (fmt_size(len), len as i64, fmt_time(t), t),
+                None => ("?".to_string(), -1, String::new(), -1),
+            };
+            let id = paths.len() as u32;
+            ui.store.insert_with_values(
+                None,
+                &[
+                    (COL_NAME, &name),
+                    (COL_PATH, &parent),
+                    (COL_SIZE, &size.as_str()),
+                    (COL_MODIFIED, &modified.as_str()),
+                    (COL_ID, &id),
+                    (COL_SIZE_N, &size_n),
+                    (COL_MTIME_N, &mtime_n),
+                ],
+            );
+            paths.push(row.raw);
+        }
     }
-    let capped = if hits.len() >= s.max_results as usize {
+    ui.tree.set_model(Some(&ui.store));
+    let capped = if n >= s.max_results as usize {
         " (limit reached)"
     } else {
         ""
     };
     ui.status.set_text(&format!(
         "{} result{}{} in {:.1} ms{}",
-        hits.len(),
-        if hits.len() == 1 { "" } else { "s" },
+        n,
+        if n == 1 { "" } else { "s" },
         capped,
         elapsed.as_secs_f64() * 1000.0,
         badges
@@ -636,17 +739,24 @@ fn group_digits(n: u64) -> String {
 
 // ---------------------------------------------------------------- actions
 
-fn selected_path(ui: &Ui) -> Option<String> {
-    let (model, iter) = ui.tree.selection().selected()?;
-    model.value(&iter, COL_FULL as i32).get::<String>().ok()
+fn path_at(ui: &Ui, iter: &gtk::TreeIter) -> Option<PathBuf> {
+    let id = ui.store.value(iter, COL_ID as i32).get::<u32>().ok()?;
+    let raw = ui.paths.borrow().get(id as usize)?.clone();
+    Some(PathBuf::from(OsString::from_vec(raw)))
 }
 
+fn selected_path(ui: &Ui) -> Option<PathBuf> {
+    let (_, iter) = ui.tree.selection().selected()?;
+    path_at(ui, &iter)
+}
+
+/// The clipboard takes text, so a name that is not UTF-8 is copied with its
+/// stray bytes replaced -- the one place a raw name cannot survive.
 fn copy_selected(ui: &Ui, name_only: bool) {
     let Some(p) = selected_path(ui) else { return };
-    let text = if name_only {
-        p.rsplit('/').next().unwrap_or(&p).to_string()
-    } else {
-        p
+    let text = match p.file_name() {
+        Some(n) if name_only => n.to_string_lossy().into_owned(),
+        _ => p.to_string_lossy().into_owned(),
     };
     gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_text(&text);
     ui.status.set_text(&format!("copied {}", text));
@@ -710,20 +820,18 @@ fn show_properties(ui: &Rc<Ui>) {
 /// row. The daemon sees the move through fanotify on its own.
 fn trash_selected(ui: &Ui) {
     let Some((_, iter)) = ui.tree.selection().selected() else { return };
-    let Ok(path) = ui.store.value(&iter, COL_FULL as i32).get::<String>() else {
-        return;
-    };
+    let Some(path) = path_at(ui, &iter) else { return };
     match gio::File::for_path(&path).trash(None::<&gio::Cancellable>) {
         Ok(()) => {
             ui.store.remove(&iter);
-            ui.status.set_text(&format!("moved to trash: {}", path));
+            ui.status.set_text(&format!("moved to trash: {}", path.display()));
         }
         Err(e) => ui.status.set_text(&format!("could not move to trash: {}", e.message())),
     }
 }
 
-fn open(target: &str) {
-    let t = target.to_string();
+fn open(target: &Path) {
+    let t = target.to_path_buf();
     // Reap the child, so opening files repeatedly does not accumulate zombies.
     std::thread::spawn(move || {
         if let Ok(mut c) = std::process::Command::new("xdg-open").arg(&t).spawn() {
@@ -732,12 +840,8 @@ fn open(target: &str) {
     });
 }
 
-fn parent_dir(p: &str) -> &str {
-    match p.rfind('/') {
-        Some(0) => "/",
-        Some(i) => &p[..i],
-        None => "/",
-    }
+fn parent_dir(p: &Path) -> &Path {
+    p.parent().unwrap_or(Path::new("/"))
 }
 
 // ---------------------------------------------------------------- dialogs

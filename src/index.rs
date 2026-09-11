@@ -207,7 +207,8 @@ impl Iterator for PostingsIter<'_> {
 
 pub struct Entry {
     pub parent: u32,
-    pub name: Box<str>,
+    /// Raw bytes: a Linux file name need not be UTF-8.
+    pub name: Box<[u8]>,
     pub is_dir: bool,
     pub alive: bool,
 }
@@ -256,15 +257,16 @@ impl Index {
     /// valid during the initial walk, where readdir guarantees uniqueness;
     /// skipping the check keeps the walk linear instead of quadratic in the
     /// size of each directory.
-    pub fn add_new(&mut self, parent: u32, name: &str, is_dir: bool, ino: u64) -> u32 {
-        self.insert(parent, name, is_dir, ino)
+    pub fn add_new(&mut self, parent: u32, name: impl AsRef<[u8]>, is_dir: bool, ino: u64) -> u32 {
+        self.insert(parent, name.as_ref(), is_dir, ino)
     }
 
     /// Insert, or return the existing entry if this (parent, name) is already
     /// present. Live events can legitimately arrive twice: scan_subtree walks a
     /// newly created tree, and the individual FAN_CREATE events for the things
     /// inside it arrive afterwards.
-    pub fn add(&mut self, parent: u32, name: &str, is_dir: bool, ino: u64) -> u32 {
+    pub fn add(&mut self, parent: u32, name: impl AsRef<[u8]>, is_dir: bool, ino: u64) -> u32 {
+        let name = name.as_ref();
         if parent != NO_PARENT {
             if let Some(kids) = self.children.get(&parent) {
                 for &k in kids {
@@ -283,7 +285,7 @@ impl Index {
         self.insert(parent, name, is_dir, ino)
     }
 
-    fn insert(&mut self, parent: u32, name: &str, is_dir: bool, ino: u64) -> u32 {
+    fn insert(&mut self, parent: u32, name: &[u8], is_dir: bool, ino: u64) -> u32 {
         let id = self.entries.len() as u32;
         if self.trigrams_built {
             for_each_trigram(name, |key| {
@@ -310,7 +312,8 @@ impl Index {
         self.dir_ino.get(&ino).copied()
     }
 
-    pub fn find_child(&self, parent: u32, name: &str) -> Option<u32> {
+    pub fn find_child(&self, parent: u32, name: impl AsRef<[u8]>) -> Option<u32> {
+        let name = name.as_ref();
         self.children.get(&parent)?.iter().copied().find(|&k| {
             let e = &self.entries[k as usize];
             e.alive && &*e.name == name
@@ -335,8 +338,9 @@ impl Index {
         }
     }
 
-    pub fn path_of(&self, id: u32) -> String {
-        let mut parts: Vec<&str> = Vec::new();
+    /// The entry's full path, as raw bytes.
+    pub fn path_bytes(&self, id: u32) -> Vec<u8> {
+        let mut parts: Vec<&[u8]> = Vec::new();
         let mut cur = id;
         while cur != NO_PARENT {
             let e = &self.entries[cur as usize];
@@ -344,23 +348,29 @@ impl Index {
             cur = e.parent;
         }
         parts.reverse();
-        let mut s = String::new();
+        let mut s: Vec<u8> = Vec::new();
         for (i, p) in parts.iter().enumerate() {
             if i == 0 {
                 // root entry carries the full mount path, e.g. "/" or "/home"
-                s.push_str(p);
+                s.extend_from_slice(p);
                 continue;
             }
-            if !s.ends_with('/') {
-                s.push('/');
+            if s.last() != Some(&b'/') {
+                s.push(b'/');
             }
-            s.push_str(p);
+            s.extend_from_slice(p);
         }
         if s.is_empty() {
-            "/".to_string()
-        } else {
-            s
+            s.push(b'/');
         }
+        s
+    }
+
+    /// The entry's full path with stray bytes replaced; tests only, since
+    /// this form cannot always be opened.
+    #[cfg(test)]
+    pub fn path_of(&self, id: u32) -> String {
+        String::from_utf8_lossy(&self.path_bytes(id)).into_owned()
     }
 
     /// Default search: case-insensitive substring, matched against the full
@@ -370,13 +380,35 @@ impl Index {
             .unwrap_or_default()
     }
 
-    /// Search with the Search-menu options. Fails only on an invalid regex.
+    /// Like `search`, with paths as raw bytes.
+    pub fn search_raw(&self, pattern: &str, limit: usize) -> Vec<Vec<u8>> {
+        self.search_opts_raw(pattern, limit, &SearchOpts::default())
+            .unwrap_or_default()
+    }
+
+    /// `search_opts_raw`, with paths converted for display.
     pub fn search_opts(
         &self,
         pattern: &str,
         limit: usize,
         o: &SearchOpts,
     ) -> Result<Vec<String>, String> {
+        self.search_opts_raw(pattern, limit, o).map(|v| {
+            v.into_iter()
+                .map(|p| String::from_utf8_lossy(&p).into_owned())
+                .collect()
+        })
+    }
+
+    /// Search with the Search-menu options. Paths come back as raw bytes: a
+    /// Linux file name need not be UTF-8, and a lossy copy cannot be opened.
+    /// Fails only on an invalid regex.
+    pub fn search_opts_raw(
+        &self,
+        pattern: &str,
+        limit: usize,
+        o: &SearchOpts,
+    ) -> Result<Vec<Vec<u8>>, String> {
         if pattern.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -433,7 +465,7 @@ impl Index {
         let mut cur = id;
         while cur != NO_PARENT && cur != self.root {
             let e = &self.entries[cur as usize];
-            if e.name.starts_with('.') {
+            if e.name.first() == Some(&b'.') {
                 return true;
             }
             cur = e.parent;
@@ -467,7 +499,7 @@ impl Index {
     /// `needle` is already lowercased unless `o.match_case` is set. Trigram
     /// keys are case-folded, so candidates are a superset of case-sensitive
     /// matches as well; verification decides.
-    fn search_name(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<String> {
+    fn search_name(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
         let cs = o.match_case;
         let mut out = Vec::new();
         if self.trigrams_built && needle.len() >= 3 {
@@ -476,7 +508,7 @@ impl Index {
             };
             for id in cands {
                 if contains(&self.entries[id as usize].name, needle, cs) && self.accept(id, o) {
-                    out.push(self.path_of(id));
+                    out.push(self.path_bytes(id));
                     if out.len() >= limit {
                         break;
                     }
@@ -486,7 +518,7 @@ impl Index {
         }
         for (i, e) in self.entries.iter().enumerate() {
             if contains(&e.name, needle, cs) && self.accept(i as u32, o) {
-                out.push(self.path_of(i as u32));
+                out.push(self.path_bytes(i as u32));
                 if out.len() >= limit {
                     break;
                 }
@@ -499,7 +531,7 @@ impl Index {
     /// any trigram is unknown, which means no name can contain the needle.
     fn trigram_candidates(&self, needle: &str) -> Option<Vec<u32>> {
         let mut keys: Vec<u32> = Vec::new();
-        for_each_trigram(needle, |k| keys.push(k));
+        for_each_trigram(needle.as_bytes(), |k| keys.push(k));
         keys.sort_unstable();
         keys.dedup();
         if keys.is_empty() {
@@ -535,7 +567,7 @@ impl Index {
     ///
     /// Returns None when the last segment is too short for a trigram (or there
     /// is no trigram index); the caller then falls back to the KMP pass.
-    fn search_path_trigram(&self, needle: &str, limit: usize, o: &SearchOpts) -> Option<Vec<String>> {
+    fn search_path_trigram(&self, needle: &str, limit: usize, o: &SearchOpts) -> Option<Vec<Vec<u8>>> {
         let (anchors, strict) = self.path_anchors(needle, o.match_case)?;
         let flagged: Vec<(u32, bool)> = anchors.into_iter().map(|a| (a, !strict)).collect();
         Some(self.emit_anchored(&flagged, limit, o, &[]))
@@ -571,7 +603,7 @@ impl Index {
         };
         let mut anchors: Vec<u32> = Vec::new();
         for id in cands {
-            let p = self.path_of(id);
+            let p = self.path_bytes(id);
             let hit = if inside {
                 ends_with(&p, core, cs)
             } else {
@@ -597,7 +629,7 @@ impl Index {
         limit: usize,
         o: &SearchOpts,
         verify: &[&str],
-    ) -> Vec<String> {
+    ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut seen = vec![false; self.entries.len()];
         for &(a, include_self) in anchors {
@@ -616,11 +648,11 @@ impl Index {
                 seen[cur as usize] = true;
                 // Below the anchor, prune hidden entries rather than walking
                 // into a dot-directory only to reject everything inside it.
-                if o.hide_hidden && cur != a && self.entries[cur as usize].name.starts_with('.') {
+                if o.hide_hidden && cur != a && self.entries[cur as usize].name.first() == Some(&b'.') {
                     continue;
                 }
                 if (include_self || cur != a) && self.passes_kind(cur, o) {
-                    let p = self.path_of(cur);
+                    let p = self.path_bytes(cur);
                     if verify.iter().all(|t| contains(&p, t, o.match_case)) {
                         out.push(p);
                         if out.len() >= limit {
@@ -647,7 +679,7 @@ impl Index {
     /// and only the subtrees of the hits that pass get walked. Terms too short
     /// for trigrams are checked on each emitted path instead; with no indexable
     /// term at all, a one-pass multi-automaton scan does the job.
-    fn search_multi(&self, terms: &[String], limit: usize, o: &SearchOpts) -> Vec<String> {
+    fn search_multi(&self, terms: &[String], limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
         let cs = o.match_case;
         let folded: Vec<String> = terms
             .iter()
@@ -746,7 +778,7 @@ impl Index {
     /// down the tree as `search_path` does for one needle, with a bitmask of
     /// the terms seen so far inherited from parent to child. `terms` are
     /// already folded unless case-sensitive.
-    fn search_multi_scan(&self, terms: &[String], limit: usize, o: &SearchOpts) -> Vec<String> {
+    fn search_multi_scan(&self, terms: &[String], limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
         let k = terms.len().min(64);
         if k == 0 {
             return Vec::new();
@@ -776,7 +808,7 @@ impl Index {
                         m |= 1 << t;
                     }
                 }
-                for &b in e.name.as_bytes() {
+                for &b in e.name.iter() {
                     let c = if fold { b.to_ascii_lowercase() } else { b };
                     let (ns, h) = kmp_step(st, c, p, f);
                     st = ns;
@@ -787,9 +819,9 @@ impl Index {
                 state[i * k + t] = st as u32;
             }
             mask[i] = m;
-            ends_slash[i] = e.name.as_bytes().last() == Some(&b'/');
+            ends_slash[i] = e.name.last() == Some(&b'/');
             if m == full && self.accept(i as u32, o) {
-                out.push(self.path_of(i as u32));
+                out.push(self.path_bytes(i as u32));
                 if out.len() >= limit {
                     break;
                 }
@@ -808,7 +840,7 @@ impl Index {
     ///
     /// Entries are visited in arena order, which is safe because a child is
     /// always allocated after its parent.
-    fn search_path(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<String> {
+    fn search_path(&self, needle: &str, limit: usize, o: &SearchOpts) -> Vec<Vec<u8>> {
         let pat = needle.as_bytes();
         let fold = !o.match_case;
         let fail = kmp_failure(pat);
@@ -834,7 +866,7 @@ impl Index {
                 k = nk;
                 hit |= h;
             }
-            for &b in e.name.as_bytes() {
+            for &b in e.name.iter() {
                 let c = if fold { b.to_ascii_lowercase() } else { b };
                 let (nk, h) = kmp_step(k, c, pat, &fail);
                 k = nk;
@@ -843,10 +875,10 @@ impl Index {
 
             state[i] = k as u32;
             matched[i] = hit;
-            ends_slash[i] = e.name.as_bytes().last() == Some(&b'/');
+            ends_slash[i] = e.name.last() == Some(&b'/');
 
             if hit && self.accept(i as u32, o) {
-                out.push(self.path_of(i as u32));
+                out.push(self.path_bytes(i as u32));
                 if out.len() >= limit {
                     break;
                 }
@@ -867,8 +899,8 @@ impl Index {
         limit: usize,
         o: &SearchOpts,
         in_path: bool,
-    ) -> Result<Vec<String>, String> {
-        let re = regex::RegexBuilder::new(pattern)
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let re = regex::bytes::RegexBuilder::new(pattern)
             .case_insensitive(!o.match_case)
             .size_limit(1 << 22)
             .build()
@@ -878,7 +910,7 @@ impl Index {
         if !in_path {
             for (i, e) in self.entries.iter().enumerate() {
                 if re.is_match(&e.name) && self.accept(i as u32, o) {
-                    out.push(self.path_of(i as u32));
+                    out.push(self.path_bytes(i as u32));
                     if out.len() >= limit {
                         break;
                     }
@@ -891,21 +923,21 @@ impl Index {
         // directory's path once, in arena order (parents precede children),
         // and extend it per entry in a reused buffer, instead of calling
         // path_of() -- a walk to the root -- for all 2.5M entries.
-        let mut dir_paths: HashMap<u32, String> = HashMap::new();
-        let mut buf = String::new();
+        let mut dir_paths: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut buf: Vec<u8> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
             let id = i as u32;
             buf.clear();
             match dir_paths.get(&e.parent) {
-                _ if e.parent == NO_PARENT => buf.push_str(&e.name),
+                _ if e.parent == NO_PARENT => buf.extend_from_slice(&e.name),
                 Some(p) => {
-                    buf.push_str(p);
-                    if !p.ends_with('/') {
-                        buf.push('/');
+                    buf.extend_from_slice(p);
+                    if p.last() != Some(&b'/') {
+                        buf.push(b'/');
                     }
-                    buf.push_str(&e.name);
+                    buf.extend_from_slice(&e.name);
                 }
-                None => buf.push_str(&self.path_of(id)),
+                None => buf.extend_from_slice(&self.path_bytes(id)),
             }
             if e.is_dir {
                 dir_paths.insert(id, buf.clone());
@@ -967,30 +999,33 @@ pub fn split_terms(q: &str) -> Vec<String> {
 
 /// Suffix test; `suffix` must already be lowercased when case-insensitive.
 #[inline]
-fn ends_with(haystack: &str, suffix: &str, case_sensitive: bool) -> bool {
+fn ends_with(haystack: &[u8], suffix: impl AsRef<[u8]>, case_sensitive: bool) -> bool {
+    let suffix = suffix.as_ref();
+    if haystack.len() < suffix.len() {
+        return false;
+    }
+    let tail = &haystack[haystack.len() - suffix.len()..];
     if case_sensitive {
-        haystack.ends_with(suffix)
+        tail == suffix
     } else {
-        haystack.len() >= suffix.len()
-            && haystack.as_bytes()[haystack.len() - suffix.len()..]
-                .eq_ignore_ascii_case(suffix.as_bytes())
+        tail.eq_ignore_ascii_case(suffix)
     }
 }
 
 /// Substring test; `needle` must already be lowercased when case-insensitive.
 #[inline]
-fn contains(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+fn contains(haystack: &[u8], needle: impl AsRef<[u8]>, case_sensitive: bool) -> bool {
+    let needle = needle.as_ref();
     if case_sensitive {
-        haystack.contains(needle)
+        needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
     } else {
         contains_ascii_ci(haystack, needle)
     }
 }
 
-/// Every 3-byte window of `s`, ASCII-lowercased, packed into a u32.
+/// Every 3-byte window of `b`, ASCII-lowercased, packed into a u32.
 #[inline]
-fn for_each_trigram<F: FnMut(u32)>(s: &str, mut f: F) {
-    let b = s.as_bytes();
+fn for_each_trigram<F: FnMut(u32)>(b: &[u8], mut f: F) {
     if b.len() < 3 {
         return;
     }
@@ -1089,12 +1124,12 @@ fn kmp_step(mut k: usize, c: u8, p: &[u8], f: &[usize]) -> (usize, bool) {
 }
 
 /// Substring search ignoring ASCII case, without allocating.
-fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+fn contains_ascii_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    let h = haystack.as_bytes();
-    let n = needle_lower.as_bytes();
+    let h = haystack;
+    let n = needle_lower;
     if n.len() > h.len() {
         return false;
     }
@@ -1531,10 +1566,39 @@ mod tests {
         assert_eq!(ix.search("/home/alice/GoogleDrive/photos/", 10).len(), 2);
 
         // an empty listing empties the subtree but keeps the mount point
-        let s3 = ix.graft(drive, &[]);
+        let s3 = ix.graft::<String>(drive, &[]);
         assert_eq!(s3.removed, 4);
         assert_eq!(ix.search("IMG-", 10).len(), 0);
         assert_eq!(ix.search("GoogleDrive", 10).len(), 1);
+    }
+
+    fn latin1_tree(built: bool) -> Index {
+        let mut ix = Index::new();
+        let root = ix.add(NO_PARENT, "/data", true, 1);
+        ix.set_root(root);
+        let d = ix.add(root, "docs", true, 2);
+        ix.add(d, &b"caf\xe9-menu.txt"[..], false, 3); // Latin-1, not UTF-8
+        ix.add(d, &b"line\nbreak.txt"[..], false, 4);
+        if built {
+            ix.build_trigrams();
+        }
+        ix
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_survive_intact() {
+        for built in [false, true] {
+            let ix = latin1_tree(built);
+            let raw = b"/data/docs/caf\xe9-menu.txt".to_vec();
+            assert_eq!(ix.search_raw("menu", 10), vec![raw.clone()]);
+            assert_eq!(ix.search_raw("docs/caf", 10), vec![raw.clone()]);
+            assert_eq!(ix.search_raw("docs menu", 10), vec![raw.clone()]);
+            assert_eq!(ix.search_raw("break", 10), vec![b"/data/docs/line\nbreak.txt".to_vec()]);
+            // the display form replaces the stray byte; the raw form keeps it
+            assert!(ix.search("menu", 10)[0].contains('\u{FFFD}'));
+            let id = ix.resolve_path(&raw).expect("raw path resolves");
+            assert_eq!(ix.path_bytes(id), raw);
+        }
     }
 
     #[test]
@@ -1708,7 +1772,7 @@ mod tests {
         // Mirrors the live path: a new tree is walked wholesale, then the
         // individual create events for its contents arrive and re-add them.
         let (mut ix, alice) = sample();
-        let mut build = |ix: &mut Index| {
+        let build = |ix: &mut Index| {
             let a = ix.add(alice, "a", true, 10);
             let b = ix.add(a, "b", true, 11);
             let c = ix.add(b, "c", true, 12);
@@ -1737,21 +1801,22 @@ mod tests {
 impl Index {
     /// Walk the tree by path components. Used when a fanotify event names a
     /// directory whose inode we have not seen yet.
-    pub fn resolve_path(&self, path: &str) -> Option<u32> {
+    pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> Option<u32> {
+        let path = path.as_ref();
         let cur0 = self.root;
         if cur0 == NO_PARENT {
             return None;
         }
         // The root entry stores its full mount path (e.g. "/home"), so strip
         // that prefix before walking components.
-        let root_name: &str = &self.entries[cur0 as usize].name;
-        let rest = if root_name == "/" {
+        let root_name: &[u8] = &self.entries[cur0 as usize].name;
+        let rest = if root_name == b"/" {
             path
         } else {
             path.strip_prefix(root_name)?
         };
         let mut cur = cur0;
-        for comp in rest.split('/').filter(|c| !c.is_empty()) {
+        for comp in rest.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
             cur = self.find_child(cur, comp)?;
         }
         Some(cur)
@@ -1803,7 +1868,7 @@ impl Index {
     /// are rescanned rather than watched: they are a different filesystem, so
     /// their inode numbers would collide with the watched one's in `dir_ino`
     /// and misroute fanotify events.
-    fn insert_foreign(&mut self, parent: u32, name: &str, is_dir: bool) -> u32 {
+    fn insert_foreign(&mut self, parent: u32, name: &[u8], is_dir: bool) -> u32 {
         let id = self.entries.len() as u32;
         if self.trigrams_built {
             for_each_trigram(name, |key| self.trigrams.entry(key).or_default().push(id));
@@ -1830,7 +1895,7 @@ impl Index {
     /// repeated rescans do not grow the arena; vanished ones just stay dead.
     /// `remove()` is deliberately not used: it prunes `dir_ino` per directory,
     /// which is quadratic across 26k directories.
-    pub fn graft(&mut self, mount: u32, walked: &[(u32, String, bool)]) -> GraftStats {
+    pub fn graft<N: AsRef<[u8]>>(&mut self, mount: u32, walked: &[(u32, N, bool)]) -> GraftStats {
         let mut was_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut stack: Vec<u32> = self.children.get(&mount).cloned().unwrap_or_default();
         while let Some(id) = stack.pop() {
@@ -1845,7 +1910,7 @@ impl Index {
         }
 
         let mut ids: Vec<u32> = Vec::with_capacity(walked.len());
-        let mut lookups: HashMap<u32, HashMap<Box<str>, u32>> = HashMap::new();
+        let mut lookups: HashMap<u32, HashMap<Box<[u8]>, u32>> = HashMap::new();
         let (mut added, mut unchanged) = (0usize, 0usize);
         for (parent_local, name, is_dir) in walked {
             let parent = if *parent_local == NO_PARENT {
@@ -1865,7 +1930,7 @@ impl Index {
                         })
                         .unwrap_or_default()
                 })
-                .get(name.as_str())
+                .get(name.as_ref())
                 .copied();
             let id = match existing {
                 Some(k) => {
@@ -1881,7 +1946,7 @@ impl Index {
                 }
                 None => {
                     added += 1;
-                    self.insert_foreign(parent, name, *is_dir)
+                    self.insert_foreign(parent, name.as_ref(), *is_dir)
                 }
             };
             ids.push(id);

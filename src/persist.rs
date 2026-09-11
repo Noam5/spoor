@@ -41,7 +41,7 @@ pub fn save(ix: &Index, path: &str) -> io::Result<usize> {
             w.write_all(&e.parent.to_le_bytes())?;
             let flags = (e.is_dir as u8) | ((e.alive as u8) << 1);
             w.write_all(&[flags])?;
-            let nb = e.name.as_bytes();
+            let nb: &[u8] = &e.name;
             w.write_all(&(nb.len() as u16).to_le_bytes())?;
             w.write_all(nb)?;
         }
@@ -81,7 +81,7 @@ pub fn load(path: &str) -> io::Result<Index> {
         r.read_exact(&mut namebuf)?;
         entries.push(Entry {
             parent,
-            name: String::from_utf8_lossy(&namebuf).into_owned().into_boxed_str(),
+            name: namebuf.clone().into_boxed_slice(),
             is_dir: fb[0] & 1 != 0,
             alive: fb[0] & 2 != 0,
         });
@@ -108,6 +108,19 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         std::fs::remove_file(&path).ok();
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn snapshot_keeps_raw_name_bytes() {
+        let mut ix = Index::new();
+        let r = ix.add(NO_PARENT, "/tmp", true, 1);
+        ix.set_root(r);
+        ix.add(r, &b"caf\xe9"[..], false, 2);
+        let path = format!("/tmp/spoor-raw-test-{}.bin", std::process::id());
+        save(&ix, &path).unwrap();
+        let back = load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.search_raw("caf", 10), vec![b"/tmp/caf\xe9".to_vec()]);
     }
 
     #[test]

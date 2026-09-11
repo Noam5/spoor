@@ -5,8 +5,15 @@
 //!
 //! This process is long-lived and holds the daemon socket, so a keystroke costs
 //! one socket round-trip rather than a process spawn.
+//!
+//! D-Bus strings must be UTF-8 and a Linux file name need not be, so a match is
+//! identified by its percent-encoded file:// URI, which carries any bytes and is
+//! also what KRunner wants in "urls".
 
+use crate::index::SearchOpts;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use zbus::zvariant::Value;
 
 /// KRunner::QueryMatch::Type
@@ -22,8 +29,9 @@ pub struct Runner {
 type Match = (String, String, String, i32, f64, HashMap<String, Value<'static>>);
 
 impl Runner {
-    fn query(&self, pattern: &str, limit: usize) -> Vec<String> {
-        crate::query::query(&self.socket, pattern, limit)
+    fn query(&self, pattern: &str, limit: usize) -> Vec<Vec<u8>> {
+        crate::query::search(&self.socket, pattern, limit, &SearchOpts::default())
+            .unwrap_or_default()
     }
 }
 
@@ -58,7 +66,9 @@ impl Runner {
 
         paths
             .into_iter()
-            .map(|path| {
+            .map(|raw| {
+                let uri = file_uri(&raw);
+                let path = String::from_utf8_lossy(&raw);
                 let name = path.rsplit('/').next().unwrap_or(&path).to_string();
                 let parent = path
                     .rfind('/')
@@ -79,32 +89,33 @@ impl Runner {
 
                 let mut props: HashMap<String, Value<'static>> = HashMap::new();
                 props.insert("subtext".to_string(), Value::from(parent));
-                props.insert(
-                    "urls".to_string(),
-                    Value::from(vec![format!("file://{}", path)]),
-                );
+                props.insert("urls".to_string(), Value::from(vec![uri.clone()]));
                 props.insert("category".to_string(), Value::from("Files"));
 
-                (
-                    path.clone(),
-                    name,
-                    icon_for(&path).to_string(),
-                    mtype,
-                    relevance,
-                    props,
-                )
+                let icon = icon_for(&path).to_string();
+                (uri, name, icon, mtype, relevance, props)
             })
             .collect()
     }
 
     #[zbus(name = "Run")]
     fn run(&self, match_id: &str, action_id: &str) {
-        let target = if action_id == "folder" {
-            match_id.rfind('/').map(|i| &match_id[..i]).unwrap_or("/")
-        } else {
-            match_id
+        let Some(path) = path_from_uri(match_id) else {
+            return;
         };
-        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+        let target = if action_id == "folder" {
+            parent_dir(&path)
+        } else {
+            &path[..]
+        };
+        let target = OsStr::from_bytes(target).to_os_string();
+        // This process lives as long as the session: reap each child, or every
+        // file opened from KRunner leaves a zombie behind.
+        std::thread::spawn(move || {
+            if let Ok(mut c) = std::process::Command::new("xdg-open").arg(&target).spawn() {
+                let _ = c.wait();
+            }
+        });
     }
 
     #[zbus(name = "SetActivationToken")]
@@ -112,6 +123,47 @@ impl Runner {
 
     #[zbus(name = "Teardown")]
     fn teardown(&self) {}
+}
+
+fn parent_dir(p: &[u8]) -> &[u8] {
+    match p.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => b"/",
+        Some(i) => &p[..i],
+    }
+}
+
+/// RFC 8089 file URI: every byte outside the unreserved set and '/' is
+/// percent-encoded, so spaces, '#', '%' and non-UTF-8 bytes all survive.
+fn file_uri(path: &[u8]) -> String {
+    let mut s = String::with_capacity(path.len() + 8);
+    s.push_str("file://");
+    for &b in path {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("%{:02X}", b));
+        }
+    }
+    s
+}
+
+/// Inverse of `file_uri`. None for anything that is not a well-formed
+/// file:// URI naming an absolute local path.
+fn path_from_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("file://")?.as_bytes();
+    let mut out = Vec::with_capacity(rest.len());
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == b'%' {
+            let hex = std::str::from_utf8(rest.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(rest[i]);
+            i += 1;
+        }
+    }
+    (out.first() == Some(&b'/')).then_some(out)
 }
 
 fn icon_for(path: &str) -> &'static str {
@@ -140,5 +192,33 @@ pub fn serve(socket: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("spoor: krunner runner registered at org.kde.spoor /runner");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uris_carry_any_path_bytes() {
+        let raw = b"/home/alice/a b/100%#?/caf\xe9\n.txt";
+        let uri = file_uri(raw);
+        assert_eq!(uri, "file:///home/alice/a%20b/100%25%23%3F/caf%E9%0A.txt");
+        assert_eq!(path_from_uri(&uri).as_deref(), Some(&raw[..]));
+        assert_eq!(file_uri(b"/plain/name.txt"), "file:///plain/name.txt");
+    }
+
+    #[test]
+    fn malformed_uris_are_refused() {
+        assert_eq!(path_from_uri("/no/scheme"), None);
+        assert_eq!(path_from_uri("file://relative"), None);
+        assert_eq!(path_from_uri("file:///bad%zz"), None);
+        assert_eq!(path_from_uri("file:///cut%4"), None);
+    }
+
+    #[test]
+    fn parents() {
+        assert_eq!(parent_dir(b"/a/b"), b"/a");
+        assert_eq!(parent_dir(b"/a"), b"/");
     }
 }

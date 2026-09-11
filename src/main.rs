@@ -81,10 +81,15 @@ fn main() {
                 hide_hidden: has_flag(&args, "--no-hidden"),
             };
             let pattern = positionals(&args).join(" ");
+            let null = has_flag(&args, "--null");
             match query::search(&sock, &pattern, limit, &opts) {
                 Ok(hits) => {
+                    // Raw bytes, as locate prints them: a name need not be UTF-8.
+                    // --null separates with NUL, for names containing newlines.
+                    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
                     for h in hits {
-                        println!("{}", h);
+                        let _ = std::io::Write::write_all(&mut out, &h);
+                        let _ = std::io::Write::write_all(&mut out, if null { b"\0" } else { b"\n" });
                     }
                 }
                 Err(e) => {
@@ -138,7 +143,7 @@ fn main() {
             eprintln!("                     [--rescan PATH]... [--rescan-interval SECS]");
             eprintln!("                     [--reconcile-interval SECS]  (default 86400, 0 = never)");
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
-            eprintln!("                        [--files|--folders] [--no-hidden]");
+            eprintln!("                        [--files|--folders] [--no-hidden] [--null]");
             eprintln!("  spoor stats");
             eprintln!("  spoor bench <pattern>… [--opts FLAGS] [--n N]  (server-side timing)");
             eprintln!("  spoor krunner            (KDE KRunner D-Bus runner)");
@@ -377,7 +382,7 @@ fn daemon(
     let _ = std::fs::remove_file(sock);
 }
 
-type Listings = Arc<Mutex<HashMap<String, Vec<(u32, String, bool)>>>>;
+type Listings = Arc<Mutex<HashMap<String, Vec<(u32, Vec<u8>, bool)>>>>;
 
 /// Events applied while a reconciliation walk runs, kept for replay onto the
 /// fresh index. Pushed and taken only under the index write lock, so every
@@ -530,7 +535,12 @@ fn apply(ix: &mut Index, ev: &watch::Event) {
     if ev.is_create() {
         // Reconstruct the path from the index rather than from the event, so we
         // do not depend on resolving handles back to paths.
-        let full = format!("{}/{}", ix.path_of(parent).trim_end_matches('/'), ev.name);
+        let mut full = ix.path_bytes(parent);
+        if full.last() != Some(&b'/') {
+            full.push(b'/');
+        }
+        full.extend_from_slice(&ev.name);
+        let full = std::path::PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(full));
         let ino = std::fs::symlink_metadata(&full)
             .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
             .unwrap_or(0);
