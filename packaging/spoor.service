@@ -23,7 +23,9 @@ ExecStart=/usr/local/bin/spoor daemon \
 # Runs as root: FAN_MARK_FILESYSTEM, FAN_UNLIMITED_QUEUE and
 # FAN_UNLIMITED_MARKS all require CAP_SYS_ADMIN. Nothing else is needed, so the
 # bounding set is narrowed to just those.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+# CAP_SETUID and CAP_SETGID let a query thread take on the caller's filesystem
+# identity, so results are filtered by what that user may list (see ipc.rs).
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 
 # systemd creates and owns /var/lib/spoor for the snapshot.
