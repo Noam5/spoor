@@ -64,7 +64,7 @@ extern "C" {
     fn open_by_handle_at(mount_fd: i32, handle: *const FileHandle, flags: i32) -> i32;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Event {
     pub mask: u64,
     /// Inode of the directory containing the change.
@@ -92,6 +92,10 @@ pub static HANDLE_FAILURES: std::sync::atomic::AtomicUsize =
 pub struct Watcher {
     fd: RawFd,
     mount_fd: RawFd,
+    /// st_dev of the watched tree. One filesystem mark on btrfs also covers
+    /// every other subvolume, whose inode numbers repeat; events resolved to a
+    /// different device are not ours.
+    root_dev: u64,
     buf: Vec<u8>,
 }
 
@@ -105,7 +109,13 @@ impl Watcher {
             | FAN_UNLIMITED_MARKS;
         let fd = unsafe { fanotify_init(flags, libc::O_RDONLY as u32) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            let hint = match e.raw_os_error() {
+                Some(libc::EINVAL) => " -- spoor needs Linux 5.9 or newer (FAN_REPORT_DFID_NAME)",
+                Some(libc::EPERM) => " -- spoor needs CAP_SYS_ADMIN; run it as root",
+                _ => "",
+            };
+            return Err(io::Error::new(e.kind(), format!("fanotify_init: {}{}", e, hint)));
         }
 
         let cpath = std::ffi::CString::new(mount).unwrap();
@@ -122,7 +132,17 @@ impl Watcher {
         if rc < 0 {
             let e = io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(e);
+            let hint = match e.raw_os_error() {
+                Some(libc::EXDEV) => {
+                    " -- fanotify rejects this path as a filesystem mark (a btrfs \
+                     subvolume on kernels before 6.8 does this)"
+                }
+                Some(libc::ENODEV) | Some(libc::EOPNOTSUPP) => {
+                    " -- this filesystem does not support fanotify file handles"
+                }
+                _ => "",
+            };
+            return Err(io::Error::new(e.kind(), format!("fanotify_mark {}: {}{}", mount, e, hint)));
         }
 
         // Needed by open_by_handle_at to resolve handles back to paths.
@@ -133,9 +153,13 @@ impl Watcher {
             return Err(e);
         }
 
+        let root_dev = std::fs::metadata(mount)
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+            .unwrap_or(0);
         Ok(Watcher {
             fd,
             mount_fd,
+            root_dev,
             buf: vec![0u8; 256 * 1024],
         })
     }
@@ -147,16 +171,7 @@ impl Watcher {
     }
 
     /// Block until events arrive, then decode the batch.
-    ///
-    /// The buffer holds variable-length kernel records that are only 4-byte
-    /// aligned, while the metadata struct needs 8: every struct is therefore
-    /// copied out with read_unaligned rather than referenced in place (a
-    /// misaligned reference is undefined behaviour), and every offset is
-    /// checked against its record's end first. This runs as root; a malformed
-    /// record is skipped, never read past.
     pub fn read_events(&mut self) -> io::Result<Vec<Event>> {
-        const META: usize = std::mem::size_of::<EventMetadata>();
-        const HDR: usize = std::mem::size_of::<InfoHeader>();
         let n = unsafe {
             libc::read(
                 self.fd,
@@ -168,80 +183,9 @@ impl Watcher {
             return Err(io::Error::last_os_error());
         }
         let total = n as usize;
-        let mut out = Vec::new();
-        let mut off = 0usize;
-
-        while off + META <= total {
-            let meta: EventMetadata = unsafe {
-                std::ptr::read_unaligned(self.buf.as_ptr().add(off) as *const EventMetadata)
-            };
-            let ev_len = meta.event_len as usize;
-            if ev_len < META || off + ev_len > total {
-                break;
-            }
-            let end = off + ev_len;
-
-            if meta.mask & FAN_Q_OVERFLOW != 0 {
-                out.push(Event {
-                    mask: meta.mask,
-                    parent_ino: 0,
-                    parent_path: None,
-                    name: String::new(),
-                });
-                off = end;
-                continue;
-            }
-
-            // Info records follow the fixed metadata header.
-            let mut ioff = off + (meta.metadata_len as usize).max(META);
-            while ioff + HDR <= end {
-                let hdr: InfoHeader = unsafe {
-                    std::ptr::read_unaligned(self.buf.as_ptr().add(ioff) as *const InfoHeader)
-                };
-                let hlen = hdr.len as usize;
-                if hlen < HDR || ioff + hlen > end {
-                    break;
-                }
-                if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
-                    if let Some(ev) = self.decode_dfid_name(meta.mask, ioff, ioff + hlen) {
-                        out.push(ev);
-                    }
-                }
-                ioff += hlen;
-            }
-            off = end;
-        }
-        Ok(out)
-    }
-
-    /// Decode one DFID_NAME info record occupying buf[start..end]: header (4),
-    /// fsid (8), struct file_handle (8 + handle_bytes), then a NUL-terminated
-    /// name. Returns None for anything that does not fit.
-    fn decode_dfid_name(&self, mask: u64, start: usize, end: usize) -> Option<Event> {
-        let fh_off = start + 4 + 8;
-        if fh_off + 8 > end {
-            return None;
-        }
-        let fh: FileHandle = unsafe {
-            std::ptr::read_unaligned(self.buf.as_ptr().add(fh_off) as *const FileHandle)
-        };
-        let handle_bytes = fh.handle_bytes as usize;
-        let name_off = fh_off + 8 + handle_bytes;
-        if handle_bytes > MAX_HANDLE_SZ || name_off >= end {
-            return None;
-        }
-        let nul = self.buf[name_off..end].iter().position(|&b| b == 0)?;
-        let name = String::from_utf8_lossy(&self.buf[name_off..name_off + nul]).into_owned();
-        if name.is_empty() || name == "." {
-            return None;
-        }
-        let (ino, path) = self.resolve_handle(&fh, fh_off);
-        Some(Event {
-            mask,
-            parent_ino: ino,
-            parent_path: path,
-            name,
-        })
+        Ok(parse_events(&self.buf[..total], &|fh, fh_off| {
+            self.resolve_handle(fh, fh_off)
+        }))
     }
 
     /// Turn a directory file handle into (inode, path). `fh` is a copy of the
@@ -253,11 +197,26 @@ impl Watcher {
     /// open_by_handle_at is the fallback for other handle types; it is
     /// unverified beyond ext4 (it returned EBADF in early testing).
     fn resolve_handle(&self, fh: &FileHandle, fh_off: usize) -> (u64, Option<String>) {
+        // Formats that carry the inode in the clear (generic ext2/3/4 and xfs
+        // encoders, native byte order). The caller has already checked that
+        // handle_bytes of payload lie inside the record.
         const FILEID_INO32_GEN: i32 = 1;
-        if fh.handle_type == FILEID_INO32_GEN && fh.handle_bytes >= 8 {
-            let b = &self.buf[fh_off + 8..fh_off + 12];
-            let ino = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as u64;
-            return (ino, None);
+        const FILEID_INO32_GEN_PARENT: i32 = 2;
+        const FILEID_INO64_GEN: i32 = 0x81;
+        const FILEID_INO64_GEN_PARENT: i32 = 0x82;
+        let p = fh_off + 8;
+        let hb = fh.handle_bytes as usize;
+        match fh.handle_type {
+            FILEID_INO32_GEN | FILEID_INO32_GEN_PARENT if hb >= 8 => {
+                let b = &self.buf[p..p + 4];
+                return (u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as u64, None);
+            }
+            FILEID_INO64_GEN | FILEID_INO64_GEN_PARENT if hb >= 12 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&self.buf[p..p + 8]);
+                return (u64::from_ne_bytes(b), None);
+            }
+            _ => {}
         }
         // The kernel needs the whole handle, header and payload, contiguous:
         // pass a raw pointer into the buffer, never a reference.
@@ -295,12 +254,111 @@ impl Watcher {
         } else {
             0
         };
+        let dev = st.st_dev as u64;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", dfd))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
         unsafe { libc::close(dfd) };
+        if ino == 0 || dev != self.root_dev {
+            return (0, None); // another subvolume or filesystem: not indexed here
+        }
         (ino, path)
     }
+}
+
+/// Decode a buffer of fanotify records.
+///
+/// The records are variable-length and only 4-byte aligned, while the metadata
+/// struct needs 8: every struct is copied out with read_unaligned rather than
+/// referenced in place (a misaligned reference is undefined behaviour), and
+/// every offset is checked against its record's end before it is read. This
+/// runs as root; a malformed record is skipped, never read past. `resolve`
+/// turns a directory file handle (header copy, offset of the header in `buf`)
+/// into an inode and optional path.
+fn parse_events(
+    buf: &[u8],
+    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<String>),
+) -> Vec<Event> {
+    const META: usize = std::mem::size_of::<EventMetadata>();
+    const HDR: usize = std::mem::size_of::<InfoHeader>();
+    let total = buf.len();
+    let mut out = Vec::new();
+    let mut off = 0usize;
+
+    while off + META <= total {
+        let meta: EventMetadata =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EventMetadata) };
+        let ev_len = meta.event_len as usize;
+        if ev_len < META || off + ev_len > total {
+            break;
+        }
+        let end = off + ev_len;
+
+        if meta.mask & FAN_Q_OVERFLOW != 0 {
+            out.push(Event {
+                mask: meta.mask,
+                parent_ino: 0,
+                parent_path: None,
+                name: String::new(),
+            });
+            off = end;
+            continue;
+        }
+
+        // Info records follow the fixed metadata header.
+        let mut ioff = off + (meta.metadata_len as usize).max(META);
+        while ioff + HDR <= end {
+            let hdr: InfoHeader =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(ioff) as *const InfoHeader) };
+            let hlen = hdr.len as usize;
+            if hlen < HDR || ioff + hlen > end {
+                break;
+            }
+            if hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
+                if let Some(ev) = decode_dfid_name(buf, meta.mask, ioff, ioff + hlen, resolve) {
+                    out.push(ev);
+                }
+            }
+            ioff += hlen;
+        }
+        off = end;
+    }
+    out
+}
+
+/// Decode one DFID_NAME info record occupying buf[start..end]: header (4),
+/// fsid (8), struct file_handle (8 + handle_bytes), then a NUL-terminated name.
+/// Returns None for anything that does not fit.
+fn decode_dfid_name(
+    buf: &[u8],
+    mask: u64,
+    start: usize,
+    end: usize,
+    resolve: &dyn Fn(&FileHandle, usize) -> (u64, Option<String>),
+) -> Option<Event> {
+    let fh_off = start + 4 + 8;
+    if fh_off + 8 > end {
+        return None;
+    }
+    let fh: FileHandle =
+        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(fh_off) as *const FileHandle) };
+    let handle_bytes = fh.handle_bytes as usize;
+    let name_off = fh_off + 8 + handle_bytes;
+    if handle_bytes > MAX_HANDLE_SZ || name_off >= end {
+        return None;
+    }
+    let nul = buf[name_off..end].iter().position(|&b| b == 0)?;
+    let name = String::from_utf8_lossy(&buf[name_off..name_off + nul]).into_owned();
+    if name.is_empty() || name == "." {
+        return None;
+    }
+    let (ino, path) = resolve(&fh, fh_off);
+    Some(Event {
+        mask,
+        parent_ino: ino,
+        parent_path: path,
+        name,
+    })
 }
 
 impl Drop for Watcher {
@@ -308,6 +366,139 @@ impl Drop for Watcher {
         unsafe {
             libc::close(self.fd);
             libc::close(self.mount_fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One fanotify event carrying a DFID_NAME record, laid out as the kernel
+    /// writes it (info records padded to 4 bytes).
+    fn record(mask: u64, handle_type: i32, payload: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut info = vec![FAN_EVENT_INFO_TYPE_DFID_NAME, 0, 0, 0];
+        info.extend_from_slice(&[0u8; 8]); // fsid
+        info.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        info.extend_from_slice(&handle_type.to_ne_bytes());
+        info.extend_from_slice(payload);
+        info.extend_from_slice(name);
+        info.push(0);
+        while info.len() % 4 != 0 {
+            info.push(0);
+        }
+        let ilen = info.len() as u16;
+        info[2..4].copy_from_slice(&ilen.to_ne_bytes());
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&((24 + info.len()) as u32).to_ne_bytes()); // event_len
+        ev.extend_from_slice(&[3, 0]); // vers, reserved
+        ev.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+        ev.extend_from_slice(&mask.to_ne_bytes());
+        ev.extend_from_slice(&(-1i32).to_ne_bytes()); // fd
+        ev.extend_from_slice(&42i32.to_ne_bytes()); // pid
+        ev.extend_from_slice(&info);
+        ev
+    }
+
+    fn by_type(fh: &FileHandle, _off: usize) -> (u64, Option<String>) {
+        (fh.handle_type as u64, None)
+    }
+
+    #[test]
+    fn decodes_a_create_event() {
+        let buf = record(FAN_CREATE | FAN_ONDIR, 1, &[7, 0, 0, 0, 9, 9, 9, 9], b"photos");
+        let evs = parse_events(&buf, &by_type);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].name, "photos");
+        assert!(evs[0].is_dir() && evs[0].is_create());
+        assert_eq!(evs[0].parent_ino, 1, "resolver saw the handle type");
+    }
+
+    #[test]
+    fn records_at_unaligned_offsets() {
+        // 24 + 4 + 8 + 8 + 8 + len("abcd") + NUL = 57, padded to 60: 4- but
+        // not 8-aligned, so the second record's u64 mask sits misaligned
+        let mut buf = record(FAN_CREATE, 1, &[1; 8], b"abcd");
+        assert_eq!(buf.len() % 8, 4);
+        buf.extend(record(FAN_DELETE, 1, &[2; 8], b"second"));
+        let evs = parse_events(&buf, &by_type);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].name, "second");
+        assert!(evs[1].is_delete());
+    }
+
+    #[test]
+    fn truncated_buffers_yield_only_whole_events() {
+        let mut buf = record(FAN_CREATE, 1, &[1; 8], b"first");
+        let whole = buf.len();
+        buf.extend(record(FAN_CREATE, 1, &[1; 8], b"cut-off"));
+        for cut in 0..buf.len() {
+            let evs = parse_events(&buf[..cut], &by_type);
+            assert_eq!(evs.len(), if cut >= whole { 1 } else { 0 }, "cut at {}", cut);
+        }
+    }
+
+    #[test]
+    fn malformed_records_are_skipped() {
+        // handle larger than the kernel allows
+        let big = record(FAN_CREATE, 1, &[0; 200], b"x");
+        assert!(parse_events(&big, &by_type).is_empty());
+        // name with no terminator inside the record
+        let mut noterm = record(FAN_CREATE, 1, &[0; 8], b"name");
+        let n = noterm.len();
+        for b in &mut noterm[n - 4..] {
+            *b = b'z';
+        }
+        assert!(parse_events(&noterm, &by_type).is_empty());
+        // info header with length 0 must not loop forever
+        let mut zero = record(FAN_CREATE, 1, &[0; 8], b"name");
+        zero[24 + 2] = 0;
+        zero[24 + 3] = 0;
+        assert!(parse_events(&zero, &by_type).is_empty());
+        // event_len smaller than the metadata
+        let mut short = record(FAN_CREATE, 1, &[0; 8], b"name");
+        short[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        assert!(parse_events(&short, &by_type).is_empty());
+    }
+
+    #[test]
+    fn queue_overflow_is_reported() {
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&24u32.to_ne_bytes());
+        ev.extend_from_slice(&[3, 0]);
+        ev.extend_from_slice(&24u16.to_ne_bytes());
+        ev.extend_from_slice(&FAN_Q_OVERFLOW.to_ne_bytes());
+        ev.extend_from_slice(&(-1i32).to_ne_bytes());
+        ev.extend_from_slice(&0i32.to_ne_bytes());
+        let evs = parse_events(&ev, &by_type);
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].mask & FAN_Q_OVERFLOW != 0);
+    }
+
+    #[test]
+    fn never_panics_on_garbage() {
+        // xorshift: deterministic, no dependency
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..5_000 {
+            let len = (next() % 600) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = parse_events(&buf, &by_type);
+        }
+        // and mutations of a valid record, which get past the first checks
+        let base = record(FAN_CREATE, 1, &[1; 8], b"valid-name");
+        for _ in 0..20_000 {
+            let mut m = base.clone();
+            for _ in 0..(1 + next() % 4) {
+                let i = (next() as usize) % m.len();
+                m[i] = next() as u8;
+            }
+            let _ = parse_events(&m, &by_type);
         }
     }
 }

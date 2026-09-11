@@ -95,6 +95,22 @@ mod tests {
     use crate::index::NO_PARENT;
 
     #[test]
+    fn snapshot_is_private_even_over_a_stale_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut ix = Index::new();
+        let r = ix.add(NO_PARENT, "/tmp", true, 1);
+        ix.set_root(r);
+        let path = format!("/tmp/spoor-perm-test-{}.bin", std::process::id());
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save(&ix, &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
     fn snapshot_round_trip() {
         let mut ix = Index::new();
         let root = ix.add(NO_PARENT, "/tmp", true, 1);
