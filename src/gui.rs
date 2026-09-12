@@ -147,15 +147,17 @@ pub fn run(socket_override: Option<String>, default_socket: &str) {
     let app = Application::builder()
         .application_id("org.spoor.gui")
         .build();
-    // Names the window's icon, and (on X11) the taskbar entry; on Wayland the
-    // shell matches the desktop entry through StartupWMClass instead.
-    gtk::Window::set_default_icon_name("spoor");
     app.connect_activate(move |app| build(app, socket.clone()));
     // Our own argv is already parsed; do not let GTK see it.
     app.run_with_args::<&str>(&[]);
 }
 
 fn build(app: &Application, socket: String) {
+    // Names the window's icon, and (on X11) the taskbar entry; on Wayland the
+    // shell matches the desktop entry through StartupWMClass instead. It calls
+    // into GTK, so it belongs here, after activation, not while the
+    // Application is being built -- doing it earlier panics.
+    gtk::Window::set_default_icon_name("spoor");
     // Single instance: launching again brings the existing window forward.
     if let Some(w) = app.active_window() {
         w.present();
