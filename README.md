@@ -182,10 +182,6 @@ forms withhold paths containing a newline; use `SEARCH0`.
 
 ## Known gaps
 
-* On btrfs, a subvolume's directory entry reports the same inode number as the
-  mount root. Letting it into the inode map put files in the wrong folder; the
-  fix (foreign directories take no inode) is unit-tested, and a live re-test on
-  btrfs is still outstanding.
 * Deleted entries keep their memory until the daily reconciliation swaps in a
   freshly built index (or the daemon restarts).
 * A multi-word query whose words are all shorter than 3 bytes falls back to a
