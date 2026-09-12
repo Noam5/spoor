@@ -147,6 +147,9 @@ pub fn run(socket_override: Option<String>, default_socket: &str) {
     let app = Application::builder()
         .application_id("org.spoor.gui")
         .build();
+    // Names the window's icon, and (on X11) the taskbar entry; on Wayland the
+    // shell matches the desktop entry through StartupWMClass instead.
+    gtk::Window::set_default_icon_name("spoor");
     app.connect_activate(move |app| build(app, socket.clone()));
     // Our own argv is already parsed; do not let GTK see it.
     app.run_with_args::<&str>(&[]);
@@ -1243,7 +1246,7 @@ fn show_about(ui: &Ui) {
              A root daemon keeps the index live through fanotify;\n\
              this window only asks it questions.",
         )
-        .logo_icon_name("system-search")
+        .logo_icon_name("spoor")
         .build();
     d.connect_response(|d, _| d.close());
     d.show();

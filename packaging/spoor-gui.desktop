@@ -4,8 +4,11 @@ Name=File Search (spoor)
 GenericName=File Search
 Comment=Find files instantly by name or path
 Exec=/usr/local/bin/spoor gui
-Icon=system-search
+Icon=spoor
 Terminal=false
-Categories=Utility;FileTools;System;
+Categories=Utility;FileTools;
 Keywords=search;find;file;locate;everything;
 StartupNotify=true
+# GTK3 sets the Wayland app_id from the program name; without this line the
+# window matches no desktop entry and the shell falls back to a generic icon.
+StartupWMClass=spoor

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- spoor: a track left behind. A paw print seen through a magnifier, drawn
+     with flat shapes and a single accent colour so it stays legible at 16px. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <clipPath id="lens">
+      <circle cx="21" cy="21" r="15"/>
+    </clipPath>
+  </defs>
+
+  <!-- handle, under the lens so the join is clean -->
+  <path d="M31.5 31.5 L42 42" stroke="#37474f" stroke-width="6.5"
+        stroke-linecap="round" fill="none"/>
+  <path d="M31.5 31.5 L42 42" stroke="#546e7a" stroke-width="3.2"
+        stroke-linecap="round" fill="none"/>
+
+  <!-- glass -->
+  <circle cx="21" cy="21" r="15" fill="#e8f1f5"/>
+
+  <!-- the track: four toes and a pad -->
+  <g clip-path="url(#lens)" fill="#2e7d6b">
+    <ellipse cx="14.6" cy="16.4" rx="2.5" ry="3.3" transform="rotate(-18 14.6 16.4)"/>
+    <ellipse cx="19.7" cy="13.6" rx="2.6" ry="3.5"/>
+    <ellipse cx="25.1" cy="14.2" rx="2.6" ry="3.5" transform="rotate(12 25.1 14.2)"/>
+    <ellipse cx="29.4" cy="17.7" rx="2.4" ry="3.2" transform="rotate(26 29.4 17.7)"/>
+    <path d="M21.8 20.2c4.6 0 7.9 3.2 7.9 6.9 0 3.3-2.9 4.9-5.6 4.9-1.4 0-2.1-.5-3.2-.5
+             -1.1 0-1.8.5-3.2.5-2.7 0-5.3-1.6-5.3-4.9 0-3.7 3.1-6.9 7.4-6.9z"/>
+  </g>
+
+  <!-- rim last, so it sits above glass and track -->
+  <circle cx="21" cy="21" r="15" fill="none" stroke="#37474f" stroke-width="4"/>
+  <circle cx="21" cy="21" r="12.4" fill="none" stroke="#ffffff" stroke-width="1"
+          opacity="0.35"/>
+</svg>
