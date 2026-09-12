@@ -1,195 +1,107 @@
 # spoor
 
-Instant file-name search for Linux, in the spirit of Everything. A root daemon
-keeps an index of a directory tree current through fanotify; a CLI, a GTK
-window and a KDE KRunner plugin query it over a Unix socket.
+Instant file-name search for Linux. Type a few letters; the results are
+already there.
 
-> **Status: 0.1.** Tested on ext4; see [Requirements](#requirements) for
-> btrfs and xfs.
+![The spoor window: a search box above results showing name, folder, size and date](docs/screenshot.png)
 
-## Why
+## How it works
 
-Unprivileged indexers such as FSearch must place a fanotify or inotify mark on
-every directory: on a home directory with ~240k folders that is ~240k marks, a
-16,384-event queue that cannot be enlarged, and new directory trees that are
-only seen if their marks get added in time. `FAN_MARK_FILESYSTEM`,
-`FAN_UNLIMITED_QUEUE` and `FAN_UNLIMITED_MARKS` remove all three problems, but
-they need `CAP_SYS_ADMIN` -- so spoor runs as a root daemon with a single mark
-for the whole filesystem, and checks every answer against the asking user's
-own permissions.
+A small background service keeps an index of your files up to date as they
+change, and the window just asks it questions. Because the index is always
+current, a search answers in about a millisecond across millions of files, and
+a file you saved a second ago is already in the results.
 
-## Design
+The service runs with privileges, so the kernel can tell it about every change
+on a disk at once instead of watching each folder separately. It never shows
+you more than you could see yourself: every result is checked against your own
+permissions first.
 
-* The index lives in the daemon, so closing a window cannot invalidate it.
-* Snapshots are written periodically and atomically, not only on exit, so a
-  crash costs at most one interval. At start-up the snapshot is served at once
-  while a full reconciliation walk runs behind it: ext4 keeps no change journal,
-  so only a rescan can establish what changed while the daemon was down. The
-  walk repeats daily (`--reconcile-interval`).
-* Names are indexed by trigrams, with delta+varint posting lists and skip
-  pointers. Path queries use trigrams on the last path segment and verify
-  candidates against their reconstructed paths; with no usable trigram, a KMP
-  automaton runs down the tree so that no path is ever materialised.
-* Names are raw bytes throughout, as Linux stores them: a name that is not
-  UTF-8, or that contains a newline, is found and opens correctly.
-* Mounts that fanotify cannot see (rclone/FUSE, network filesystems) can be
-  walked on a timer instead.
+## Installing
 
-## Measured
+    make build
+    sudo make install
+    sudo systemctl enable --now spoor
 
-On a laptop home directory of 2.3M files and 244k folders (ext4, 413 GB):
+Or build a Debian package with `make deb` and install that. For searching from
+KDE's launcher with Alt+Space, add `make install-krunner`. To remove
+everything, `sudo make uninstall`.
 
-| | |
-|---|---|
-| full walk | 7-17 s (`updatedb`: 64 s) |
-| trigram index build | ~5 s |
-| one-word query, server-side | 0.1-0.7 ms |
-| path or multi-word query | 1-5 ms |
-| regex (a scan of every name) | 50-250 ms |
-| resident memory | ~340 MB |
-| SIGKILL to a usable index | ~1 s |
+## Using it
 
-Measure with `spoor bench <pattern>`. Timing `spoor query` mostly measures
-process start-up, since the binary links GTK.
+Open **File Search** from your application menu. Type in the box and results
+appear as you go. Enter or a double-click opens one.
+
+Searching:
+
+* One word matches file names: `invoice` finds `invoice-2026-03.pdf`.
+* Several words must all appear, in the name or in the folders above it:
+  `wedding jpg` finds `Photos/Wedding 2019/IMG_0421.jpg`.
+* Quotation marks keep words together: `"annual report"`.
+* A `/` searches the whole path: `Photos/Iceland`. Ending with `/` means
+  "everything inside that folder".
+* Case is ignored, in every language: `отчёт` finds `Отчёт.pdf`.
+
+The Search menu holds Match Case (Ctrl+I), Enable Regex (Ctrl+R), Search in
+Path (Ctrl+U), and a filter for files or folders only.
+
+Click a column heading to sort by name, folder, size or date. Right-click a
+result to open it with another application, show the folder it is in, copy its
+name or path, move it to the trash, or open its properties.
+
+Preferences (Ctrl+P) has the rest: search as you type, hidden files, and how
+many results to show.
+
+## Choosing which folders to index
+
+Preferences lists the folders that are indexed, folders to leave out, and
+network folders. **Apply Folder Changes…** asks for an administrator password,
+because the index is shared by everyone on the machine, and then re-indexes.
+
+Folders on separate disks are all kept current. A folder on a disk that is not
+plugged in is skipped until it comes back.
+
+## Cloud and network folders
+
+A mounted cloud drive cannot announce its changes the way a local disk does,
+so spoor re-reads it on a timer — every 15 minutes by default. Add it under
+**Network folders** in Preferences.
+
+Such a mount is normally private to you, and the service cannot read it. With
+rclone, mount using `--allow-other --default-permissions --umask 077`: the
+kernel keeps the files owner-only while letting the service read their names.
+This also needs `user_allow_other` in `/etc/fuse.conf`. The first read after
+mounting fetches the listing from the provider and can take a while; the
+results appear once it finishes.
 
 ## Requirements
 
-* Linux 5.9 or newer (`FAN_REPORT_DFID_NAME`), systemd, root.
-* **Live updates are tested on ext4, btrfs and xfs.** A btrfs subvolume
-  cannot carry a filesystem mark of its own, so spoor marks its containing
-  mount and keeps that subtree's events. Other filesystems fall back to
-  `open_by_handle_at`; where live updates do not arrive, the daily
-  reconciliation walk bounds the drift.
-* Rust 1.87 or newer (zbus requires it) and the GTK 3 development files
-  (`libgtk-3-dev`). The
-  KRunner plugin needs a KDE Plasma 6 session.
+* Linux 5.9 or newer, systemd, and root to install.
+* Works on ext4, btrfs and xfs.
+* To build: Rust 1.87 or newer and the GTK 3 development files
+  (`libgtk-3-dev`). The launcher plugin needs KDE Plasma 6.
 
-## Install
+## Privacy and security
 
-    make build
-    sudo make install              # binary, systemd unit, desktop entry
-    sudo systemctl enable --now spoor
-    make install-krunner           # optional, per user, needs no root
+The service can see every file name in the folders it indexes, so:
 
-or build a Debian package with `make deb` and install that. By default the
-daemon indexes `/home`; see [Choosing folders](#choosing-folders).
-`sudo make uninstall` removes it again.
+* **You see only what you could see anyway.** Every result is checked against
+  your own permissions, by the kernel, before it reaches you.
+* The saved index is readable by root alone.
+* Only an administrator can change which folders are indexed.
+* File contents are never read — only names, plus the size and date your own
+  system reports for the results on screen.
 
-## Searching
+[SECURITY.md](SECURITY.md) has the details, and how to report a vulnerability.
 
-    spoor query invoice                  # names containing "invoice"
-    spoor query wedding jpg              # both words, anywhere in the path
-    spoor query '"annual report"'        # a phrase, space included
-    spoor query --path projects/2024     # match against the full path
-    spoor query --regex '^IMG_[0-9]+\.jpg$'
-    spoor query --case README --files
-    spoor query --null invoice | xargs -0 ls -l
+## Limits
 
-* **One word** matches file names. **Several words** are ANDed, and each may
-  match anywhere in the full path -- the name or any folder above it.
-  **Quotes** keep a phrase together.
-* A `/` in the query matches against the path; a trailing `/` (`photos/`)
-  means "inside that folder".
-* Case is ignored unless Match Case is on, for every script: `отчёт` finds
-  `Отчёт.pdf`.
-* **Regex** mode treats the whole query as one expression (the `regex` crate:
-  linear time, size-capped, since any local user can send patterns).
-* `spoor query` prints paths as raw bytes, one per line; `--null` ends each
-  with a NUL instead, for names that contain a newline.
-
-| option | GUI | CLI |
-|---|---|---|
-| Match Case | Ctrl+I | `--case` |
-| Enable Regex | Ctrl+R | `--regex` |
-| Search in Path | Ctrl+U | `--path` |
-| Files only / Folders only | Search menu | `--files` / `--folders` |
-| Hide dotfiles | Preferences | `--no-hidden` |
-
-The GUI (`spoor gui`, or "File Search" in the application menu) keeps these in
-`~/.config/spoor/gui.conf`. Double-click or Enter opens a result; click a
-column header to sort; right-click offers Open With, Open Containing Folder,
-Copy Path, Copy Name, Move to Trash and Properties (the file manager's own
-dialog, via `org.freedesktop.FileManager1`). With the KRunner plugin,
-Alt+Space finds files from anywhere.
-
-## Choosing folders
-
-**Edit → Preferences** in the window lists the folders to index, folders to
-leave out, and network folders to walk on a timer. **Apply Folder Changes…**
-asks for an administrator password (polkit), saves `/etc/spoor/spoor.conf` and
-restarts the index. The file can also be written by hand:
-
-    root = /home
-    root = /srv/data
-    exclude = /home/you/.cache
-    rescan = /home/you/GoogleDrive
-    rescan_interval = 900
-
-`sudo spoor configure FILE` checks such a file, installs it and restarts the
-service. Each folder gets its own fanotify mark, so folders on different disks
-are all watched live. A folder inside another folder on the same filesystem is
-merged into it. A folder on a disk that is not attached is skipped until the
-next restart.
-
-## Network and FUSE mounts
-
-fanotify only sees changes that pass through the local kernel, and the walk
-stays on one filesystem, so a mount such as an rclone Google Drive is not
-indexed by default. Listed under **Network folders** (`rescan =`), it is
-walked every `rescan_interval` seconds (default 900) instead; it must lie inside
-an indexed folder. A path that is not currently mounted is never walked -- it
-would read as an empty folder -- and is retried every minute.
-
-A FUSE mount is private to its owner, so root cannot read it by default.
-rclone accepts `--allow-root` but silently ignores it (its FUSE library dropped
-support). What works is `--allow-other --default-permissions --umask 077`: the
-kernel then enforces owner-only file modes, so other accounts -- service
-accounts included -- are refused while root reads through its capabilities.
-Plain `--allow-other` would expose the mount to every local account. Both need
-`user_allow_other` in `/etc/fuse.conf`; confirm with `findmnt` that the kernel
-options show `allow_other,default_permissions`.
-
-The first walk after rclone starts goes to the provider's API and may be
-throttled heavily (Google Drive with rclone's shared client ID: 8-25 entries/s;
-create your own client ID). Results are merged only when a walk completes.
-
-## Security
-
-The daemon runs as root and can list every name under the indexed tree; any
-local account may query it. Each result is shown only if the caller could list
-its folder: the answering thread takes on the caller's uid, gid and groups
-(read from the socket, not from the request) and asks the kernel. The
-snapshot under `/var/lib/spoor` is readable by root only; changing which
-folders are indexed needs an administrator password; the socket's work
-per client is bounded, and kernel records are parsed with explicit bounds
-checks. See [SECURITY.md](SECURITY.md) for the details and for reporting
-vulnerabilities.
-
-## Socket protocol
-
-On `/run/spoor.sock`, one request line per connection:
-
-    SEARCH0 <limit> <flags> <pattern>  -> each path as raw bytes ending in NUL;
-                                          an empty record ends the reply
-    SEARCH <limit> <flags> <pattern>   -> one path per line, blank line ends
-    QUERY <limit> <pattern>            -> SEARCH with no flags
-    STATS                              -> "entries <n> arena <n>"
-
-Flags are any of `c` (match case), `r` (regex), `p` (search in path), `f`
-(files only), `d` (folders only), `h` (hide dotfiles), or `-` for none. Errors
-come back as a record `ERR <message>`; paths always start with `/`. The line
-forms withhold paths containing a newline; use `SEARCH0`.
-
-## Known gaps
-
-* Deleted entries keep their memory until the daily reconciliation swaps in a
-  freshly built index (or the daemon restarts).
-* A multi-word query whose words are all shorter than 3 bytes falls back to a
-  full scan (up to ~0.9 s on 2.3M files when matches are rare).
-* Case folding is per character (`ß` does not match `ss`), and in regex mode
-  `.` matches a character, not a byte that is not part of valid UTF-8.
-* Copy Path and Copy Name put text on the clipboard, so a name that is not
-  UTF-8 is copied with its stray bytes replaced.
+* Deleted files keep their place in memory until the nightly rebuild.
+* A search whose every word is shorter than three letters has to look at
+  everything: about a second on a very large index.
+* Letters are matched one for one, so `ß` does not match `ss`.
+* Copying a name copies text, so a name containing unusual bytes is copied
+  with those replaced.
 
 ## License
 
