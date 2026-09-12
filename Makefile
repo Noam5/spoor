@@ -15,8 +15,8 @@ install:
 	@test -x $(BIN) || { echo "run 'make build' as your user first"; exit 1; }
 	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/spoor
 	install -Dm644 packaging/spoor.service /etc/systemd/system/spoor.service
-	install -Dm644 packaging/spoor-gui.desktop \
-	    $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
+	install -Dm644 packaging/spoor.desktop \
+	    $(DESTDIR)$(PREFIX)/share/applications/spoor.desktop
 	install -Dm644 packaging/spoor.svg \
 	    $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/spoor.svg
 	@test -f $(DESTDIR)$(PREFIX)/share/icons/hicolor/index.theme || \
@@ -34,7 +34,7 @@ install:
 uninstall:
 	-systemctl disable --now spoor
 	rm -f /etc/systemd/system/spoor.service $(DESTDIR)$(PREFIX)/bin/spoor
-	rm -f $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
+	rm -f $(DESTDIR)$(PREFIX)/share/applications/spoor.desktop $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
 	rm -f /usr/share/polkit-1/actions/org.spoor.configure.policy
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1.gz
 	rm -f $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/spoor.svg

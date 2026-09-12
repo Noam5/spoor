@@ -13,8 +13,8 @@ rm -rf target/deb && mkdir -p "$ROOT/DEBIAN"
 install -Dm755 target/release/spoor "$ROOT/usr/bin/spoor"
 sed 's|/usr/local/bin/spoor|/usr/bin/spoor|' packaging/spoor.service \
     | install -Dm644 /dev/stdin "$ROOT/usr/lib/systemd/system/spoor.service"
-sed 's|/usr/local/bin/spoor|/usr/bin/spoor|' packaging/spoor-gui.desktop \
-    | install -Dm644 /dev/stdin "$ROOT/usr/share/applications/spoor-gui.desktop"
+sed 's|/usr/local/bin/spoor|/usr/bin/spoor|' packaging/spoor.desktop \
+    | install -Dm644 /dev/stdin "$ROOT/usr/share/applications/spoor.desktop"
 install -Dm644 packaging/spoor-krunner.desktop "$ROOT/usr/share/krunner/dbusplugins/spoor.desktop"
 sed 's|@BIN@|/usr/bin/spoor|' packaging/org.kde.spoor.service.in \
     | install -Dm644 /dev/stdin "$ROOT/usr/share/dbus-1/services/org.kde.spoor.service"
