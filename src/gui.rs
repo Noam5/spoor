@@ -925,7 +925,7 @@ fn show_preferences(ui: &Rc<Ui>) {
     content.set_margin_start(12);
     content.set_margin_end(12);
 
-    let sayt = CheckButton::with_mnemonic("Search as you _type (otherwise press Enter)");
+    let sayt = CheckButton::with_mnemonic("Search as you _type");
     sayt.set_active(s.search_as_you_type);
     let hidden = CheckButton::with_mnemonic("Show _hidden files and folders");
     hidden.set_active(!s.opts.hide_hidden);
@@ -936,18 +936,9 @@ fn show_preferences(ui: &Rc<Ui>) {
     limit_label.set_mnemonic_widget(Some(&limit));
     limit_row.pack_start(&limit_label, false, false, 0);
     limit_row.pack_start(&limit, false, false, 0);
-    let note = Label::new(Some(
-        "Match Case, Enable Regex, Search in Path and the Files / Folders filter \
-         are on the Search menu (Ctrl+I, Ctrl+R, Ctrl+U).",
-    ));
-    note.set_xalign(0.0);
-    note.set_line_wrap(true);
-    note.style_context().add_class("dim-label");
-
     content.pack_start(&sayt, false, false, 0);
     content.pack_start(&hidden, false, false, 0);
     content.pack_start(&limit_row, false, false, 0);
-    content.pack_start(&note, false, false, 8);
 
     {
         let ui = ui.clone();
@@ -983,33 +974,12 @@ fn show_preferences(ui: &Rc<Ui>) {
         Ok(None) => (config::Config::default(), None),
         Err(e) => (config::Config::default(), Some(e)),
     };
-    let apply_status =
-        Label::new(Some(cfg_note.as_deref().unwrap_or(
-            "Applying asks for an administrator password, then re-indexes.",
-        )));
+    let apply_status = Label::new(cfg_note.as_deref());
     apply_status.set_xalign(0.0);
     apply_status.set_line_wrap(true);
-    let (roots_box, roots) = folder_list(
-        &dialog,
-        &apply_status,
-        "Indexed folders",
-        "kept current live",
-        &cfg.roots,
-    );
-    let (excl_box, exclude) = folder_list(
-        &dialog,
-        &apply_status,
-        "Excluded folders",
-        "left out, with everything inside them",
-        &cfg.exclude,
-    );
-    let (rescan_box, rescan) = folder_list(
-        &dialog,
-        &apply_status,
-        "Network folders",
-        "rclone or network mounts inside an indexed folder, walked on a timer",
-        &cfg.rescan,
-    );
+    let (roots_box, roots) = folder_list(&dialog, &apply_status, "Indexed folders", &cfg.roots);
+    let (excl_box, exclude) = folder_list(&dialog, &apply_status, "Excluded folders", &cfg.exclude);
+    let (rescan_box, rescan) = folder_list(&dialog, &apply_status, "Network folders", &cfg.rescan);
     let every_row = GtkBox::new(Orientation::Horizontal, 8);
     let every_label = Label::with_mnemonic("Walk network folders every (_minutes):");
     let every = SpinButton::with_range(1.0, 10_080.0, 5.0);
@@ -1078,7 +1048,6 @@ fn folder_list(
     parent: &Dialog,
     status: &Label,
     title: &str,
-    hint: &str,
     paths: &[String],
 ) -> (GtkBox, ListStore) {
     let store = ListStore::new(&[String::static_type()]);
@@ -1146,11 +1115,7 @@ fn folder_list(
     row.pack_start(&scroll, true, true, 0);
     row.pack_start(&buttons, false, false, 0);
     let label = Label::new(None);
-    label.set_markup(&format!(
-        "<b>{}</b>   <small>{}</small>",
-        glib::markup_escape_text(title),
-        glib::markup_escape_text(hint)
-    ));
+    label.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
     label.set_xalign(0.0);
     let v = GtkBox::new(Orientation::Vertical, 4);
     v.pack_start(&label, false, false, 0);
@@ -1243,11 +1208,7 @@ fn show_about(ui: &Ui) {
         .modal(true)
         .program_name("spoor")
         .version(env!("CARGO_PKG_VERSION"))
-        .comments(
-            "Instant file search for Linux.\n\
-             A root daemon keeps the index live through fanotify;\n\
-             this window only asks it questions.",
-        )
+        .comments("Instant file search for Linux.")
         .logo_icon_name("spoor")
         .build();
     d.connect_response(|d, _| d.close());
