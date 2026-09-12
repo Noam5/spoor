@@ -19,6 +19,10 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --release
+      # clippy and `cargo test` leave no plain binary behind; the self-test
+      # below runs the real one.
+      - name: Build
+        run: cargo build --release
       - name: Live fanotify self-test (needs root)
         run: sudo ./target/release/spoor selftest --root "$RUNNER_TEMP"
       - name: Debian package
