@@ -25,7 +25,8 @@ First public release.
 * Case-insensitive matching folds Unicode, not only ASCII.
 * File handles from ext4, btrfs (including subvolumes) and xfs are decoded;
   anything else falls back to `open_by_handle_at`. Live updates are tested on
-  ext4 only so far.
+  ext4, btrfs and xfs. A btrfs subvolume is watched through its containing
+  mount, since it cannot carry a filesystem mark itself.
 
 ### Front ends
 

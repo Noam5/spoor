@@ -55,10 +55,11 @@ process start-up, since the binary links GTK.
 ## Requirements
 
 * Linux 5.9 or newer (`FAN_REPORT_DFID_NAME`), systemd, root.
-* **Live updates are tested on ext4.** spoor decodes btrfs (including
-  subvolume) and xfs file handles and falls back to `open_by_handle_at`
-  elsewhere, but has not yet been run against those filesystems; the daily
-  reconciliation walk bounds any drift.
+* **Live updates are tested on ext4, btrfs and xfs.** A btrfs subvolume
+  cannot carry a filesystem mark of its own, so spoor marks its containing
+  mount and keeps that subtree's events. Other filesystems fall back to
+  `open_by_handle_at`; where live updates do not arrive, the daily
+  reconciliation walk bounds the drift.
 * Rust 1.87 or newer (zbus requires it) and the GTK 3 development files
   (`libgtk-3-dev`). The
   KRunner plugin needs a KDE Plasma 6 session.
@@ -181,6 +182,10 @@ forms withhold paths containing a newline; use `SEARCH0`.
 
 ## Known gaps
 
+* On btrfs, a subvolume's directory entry reports the same inode number as the
+  mount root. Letting it into the inode map put files in the wrong folder; the
+  fix (foreign directories take no inode) is unit-tested, and a live re-test on
+  btrfs is still outstanding.
 * Deleted entries keep their memory until the daily reconciliation swaps in a
   freshly built index (or the daemon restarts).
 * A multi-word query whose words are all shorter than 3 bytes falls back to a
