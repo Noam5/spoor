@@ -21,6 +21,8 @@ sed 's|@BIN@|/usr/bin/spoor|' packaging/org.kde.spoor.service.in \
 sed 's|@BIN@|/usr/bin/spoor|' packaging/org.spoor.configure.policy.in \
     | install -Dm644 /dev/stdin "$ROOT/usr/share/polkit-1/actions/org.spoor.configure.policy"
 for f in README.md LICENSE-MIT LICENSE-APACHE; do install -Dm644 "$f" "$ROOT/usr/share/doc/spoor/$f"; done
+install -Dm644 packaging/spoor.1 "$ROOT/usr/share/man/man1/spoor.1"
+gzip -9nf "$ROOT/usr/share/man/man1/spoor.1"
 
 # Runtime dependencies, computed from the binary rather than guessed.
 mkdir -p target/deb/shlibs/debian

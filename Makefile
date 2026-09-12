@@ -17,6 +17,8 @@ install:
 	install -Dm644 packaging/spoor.service /etc/systemd/system/spoor.service
 	install -Dm644 packaging/spoor-gui.desktop \
 	    $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
+	install -Dm644 packaging/spoor.1 $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1
+	gzip -9nf $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1
 	sed 's|@BIN@|$(PREFIX)/bin/spoor|' packaging/org.spoor.configure.policy.in \
 	    | install -Dm644 /dev/stdin /usr/share/polkit-1/actions/org.spoor.configure.policy
 	systemctl daemon-reload
@@ -28,6 +30,7 @@ uninstall:
 	rm -f /etc/systemd/system/spoor.service $(DESTDIR)$(PREFIX)/bin/spoor
 	rm -f $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
 	rm -f /usr/share/polkit-1/actions/org.spoor.configure.policy
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1.gz
 	systemctl daemon-reload
 	@echo "removed. left in place: /var/lib/spoor (snapshot), /etc/spoor (settings)"
 

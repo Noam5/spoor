@@ -1,0 +1,159 @@
+.TH SPOOR 1 "2026-09-12" "spoor 0.1.0" "User Commands"
+.SH NAME
+spoor \- instant file-name search
+.SH SYNOPSIS
+.B spoor query
+.RI [ options ] " pattern" ...
+.br
+.B spoor gui
+.RI [ --socket
+.IR PATH ]
+.br
+.B spoor daemon
+.RI [ --config
+.IR PATH "] [" --root " " DIR ]...
+.br
+.B spoor configure
+.RI [ FILE | - ]
+.br
+.B spoor stats \fR|\fB bench \fR|\fB krunner \fR|\fB selftest \fR|\fB --version
+.SH DESCRIPTION
+.B spoor
+answers file-name searches instantly, in the spirit of Everything on
+Windows. A root daemon keeps an index of the chosen folders current through
+fanotify, and serves it over a Unix socket to a command-line client, a GTK
+window and a KDE KRunner plugin.
+.PP
+Because the daemon runs as root, every reply is filtered by the asking
+user's own permissions: a result is shown only if that user could list the
+folder holding it. The check is made by the kernel, under the caller's uid,
+gid and groups, taken from the socket rather than from the request.
+.SH COMMANDS
+.TP
+.B query \fIpattern\fR...
+Print matching paths, one per line, as raw bytes. Several words are ANDed and
+each may match anywhere in the full path; double quotes keep a phrase together.
+.TP
+.B gui
+The search window. Also available as "File Search" in the application menu.
+.TP
+.B daemon
+The indexing service, normally started by systemd, not by hand.
+.TP
+.B configure \fR[\fIFILE\fR|\fB-\fR]
+Validate settings and install them in
+.IR /etc/spoor/spoor.conf ,
+then restart the service. Root only; the window's Preferences run it through
+pkexec. With
+.B -
+or no argument the settings are read from standard input.
+.TP
+.B stats
+Entry and arena counts of the running index.
+.TP
+.B bench \fIpattern\fR...
+Time queries server-side, without process start-up in the number.
+.TP
+.B selftest \fR[\fB--root \fIDIR\fR]
+Prove live indexing: watch, walk, then create a deep new directory tree and
+confirm the file inside it becomes searchable. Root only.
+.SH OPTIONS
+.SS Search options
+.TP
+.B --case
+Match case. Otherwise case is ignored, in every script.
+.TP
+.B --regex
+Treat the whole query as a regular expression.
+.TP
+.B --path
+Match against the full path, not just the name. A
+.B /
+in the query does this anyway; a trailing
+.B /
+means "inside that folder".
+.TP
+.BR --files ", " --folders
+Restrict results by type.
+.TP
+.B --no-hidden
+Leave out dot-files and everything inside dot-directories.
+.TP
+.BI --limit " N"
+At most N results (default 100).
+.TP
+.B --null
+End each result with a NUL instead of a newline, for names containing
+newlines. Pairs with
+.BR "xargs -0" .
+.SS Daemon options
+.TP
+.BI --config " PATH"
+Settings file (default
+.IR /etc/spoor/spoor.conf ).
+.TP
+.BI --root " DIR"
+Index DIR. Repeatable; adds to the settings file.
+.TP
+.BI --exclude " DIR"
+Leave DIR out, with everything beneath it. Repeatable.
+.TP
+.BI --rescan " DIR"
+Walk DIR on a timer instead of watching it, for mounts fanotify cannot see
+(rclone, network filesystems). Repeatable.
+.TP
+.BI --rescan-interval " SECS"
+Seconds between those walks (default 900).
+.TP
+.BI --reconcile-interval " SECS"
+Seconds between full reconciliation walks (default 86400, 0 to switch off).
+.TP
+.BI --socket " PATH"
+Socket to serve on (default
+.IR /run/spoor.sock ).
+.TP
+.BI --state " PATH"
+Snapshot file (default
+.IR /var/lib/spoor/index.bin ).
+.TP
+.BI --save-interval " SECS"
+Seconds between snapshots (default 60, 0 to switch off).
+.TP
+.B --no-watch
+Serve a static index, without fanotify; needs no privileges.
+.SH FILES
+.TP
+.I /etc/spoor/spoor.conf
+Which folders are indexed, excluded and rescanned. One
+.I key = value
+per line;
+.IR root ", " exclude " and " rescan
+may repeat.
+.TP
+.I /var/lib/spoor/index.bin
+Snapshot of the index, readable by root only.
+.TP
+.I ~/.config/spoor/gui.conf
+The window's own settings.
+.SH EXAMPLES
+.TP
+.B spoor query invoice
+Names containing "invoice".
+.TP
+.B spoor query wedding jpg
+Both words, anywhere in the path.
+.TP
+.B spoor query --null invoice | xargs -0 ls -l
+Names that may contain anything at all.
+.TP
+.B spoor query --regex '^IMG_[0-9]+\e.jpg$'
+A regular expression over names.
+.SH SEE ALSO
+.BR locate (1),
+.BR updatedb (8),
+.BR fanotify (7)
+.SH AUTHOR
+Noam <noam555@gmail.com>
+.SH BUGS
+Report privately through the repository's Security tab for anything
+security-related: https://github.com/Noam5/spoor

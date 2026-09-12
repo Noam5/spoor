@@ -215,6 +215,9 @@ fn main() {
             client(&sock, "STATS");
         }
         _ => {
+            // `spoor --help` is a question, not a mistake: answer it on stdout
+            // and succeed. An unknown command still fails, with the same text.
+            let asked = matches!(cmd, "--help" | "-h" | "help");
             eprintln!("spoor — privileged file index\n");
             eprintln!("  spoor daemon [--config /etc/spoor/spoor.conf] [--root DIR]... [--exclude DIR]...");
             eprintln!("                     [--socket PATH] [--state PATH]");
@@ -231,7 +234,10 @@ fn main() {
             eprintln!("  spoor bench <pattern>… [--opts FLAGS] [--n N]  (server-side timing)");
             eprintln!("  spoor krunner            (KDE KRunner D-Bus runner)");
             eprintln!("  spoor gui [--socket PATH] (standalone window)");
-            std::process::exit(2);
+            eprintln!(
+                "\nSettings: /etc/spoor/spoor.conf (Preferences in the window). See spoor(1)."
+            );
+            std::process::exit(if asked { 0 } else { 2 });
         }
     }
 }
