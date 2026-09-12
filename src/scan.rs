@@ -75,18 +75,32 @@ pub fn scan(index: &mut Index, root: &str, exclude: &Exclude) -> ScanStats {
             } else {
                 None
             };
-            let id = index.add_new(parent_id, name.as_bytes(), is_dir, entry.ino());
-
-            if let Some(child_path) = child_path {
+            // A directory is stat'ed anyway, to honour mount boundaries; its
+            // inode comes from there rather than from readdir, because a btrfs
+            // subvolume's directory entry reports the inode its own root uses,
+            // which collides with the tree being walked. A directory on another
+            // filesystem is listed with inode 0, which registers nothing.
+            let mut ino = entry.ino();
+            let mut ours = false;
+            if let Some(p) = &child_path {
                 stats.dirs += 1;
-                // stat only directories, to honour mount boundaries
-                match fs::symlink_metadata(&child_path) {
-                    Ok(m) if m.dev() == root_dev => queue.push((id, child_path)),
-                    Ok(_) => {}
-                    Err(_) => stats.errors += 1,
+                match fs::symlink_metadata(p) {
+                    Ok(m) if m.dev() == root_dev => {
+                        ino = m.ino();
+                        ours = true;
+                    }
+                    Ok(_) => ino = 0,
+                    Err(_) => {
+                        ino = 0;
+                        stats.errors += 1;
+                    }
                 }
             } else {
                 stats.files += 1;
+            }
+            let id = index.add_new(parent_id, name.as_bytes(), is_dir, ino);
+            if let (true, Some(child_path)) = (ours, child_path) {
+                queue.push((id, child_path));
             }
         }
     }
@@ -99,6 +113,9 @@ pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32, 
     if depth > 64 {
         return;
     }
+    let Ok(dev) = fs::symlink_metadata(path).map(|m| m.dev()) else {
+        return;
+    };
     let rd = match fs::read_dir(path) {
         Ok(rd) => rd,
         Err(_) => return,
@@ -113,8 +130,21 @@ pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32, 
         if is_dir && exclude.contains(&child) {
             continue;
         }
-        let id = index.add(parent_id, name.as_bytes(), is_dir, entry.ino());
+        // As in scan(): a directory of another filesystem is listed, with
+        // inode 0, and not walked into.
+        let mut ino = entry.ino();
+        let mut ours = false;
         if is_dir {
+            match fs::symlink_metadata(&child) {
+                Ok(m) if m.dev() == dev => {
+                    ino = m.ino();
+                    ours = true;
+                }
+                _ => ino = 0,
+            }
+        }
+        let id = index.add(parent_id, name.as_bytes(), is_dir, ino);
+        if ours {
             scan_subtree(index, id, &child, depth + 1, exclude);
         }
     }

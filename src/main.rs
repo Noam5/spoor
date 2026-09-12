@@ -447,6 +447,17 @@ fn daemon(o: DaemonOpts) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    let (unresolved, handles) = (
+        UNRESOLVED.load(std::sync::atomic::Ordering::Relaxed),
+        watch::HANDLE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if unresolved > 0 || handles > 0 {
+        eprintln!(
+            "spoor: {} events could not be placed in a tree, {} file handles could not be resolved",
+            unresolved, handles
+        );
+    }
+
     // Final save on the way out, in addition to (not instead of) the periodic one.
     match save_snapshot(&cat, &o.state_path) {
         Ok(n) => eprintln!("spoor: final snapshot saved ({} slots)", n),
@@ -510,7 +521,7 @@ fn watch_loop(cat: Arc<Catalog>, i: usize, mut w: watch::Watcher) {
                     buf.extend(events.iter().cloned());
                 }
                 for ev in &events {
-                    apply(&mut ix, ev, &cat.exclude);
+                    apply(&mut ix, ev, &cat.exclude, part.dev);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -547,7 +558,7 @@ fn reconcile_loop(cat: Arc<Catalog>, interval: u64) {
                 let mut ix = p.index.write().unwrap();
                 let events = p.capture.lock().unwrap().take().unwrap_or_default();
                 for ev in &events {
-                    apply(&mut fresh, ev, &cat.exclude);
+                    apply(&mut fresh, ev, &cat.exclude, p.dev);
                 }
                 let before = ix.capacity_used();
                 let after = fresh.capacity_used();
@@ -659,7 +670,7 @@ fn install_signal_handlers() {
 
 static UNRESOLVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn apply(ix: &mut Index, ev: &watch::Event, exclude: &Exclude) {
+fn apply(ix: &mut Index, ev: &watch::Event, exclude: &Exclude, root_dev: u64) {
     if ev.mask & watch::FAN_Q_OVERFLOW != 0 {
         eprintln!("spoor: FAN_Q_OVERFLOW — index may be incomplete, rescan needed");
         return;
@@ -695,12 +706,19 @@ fn apply(ix: &mut Index, ev: &watch::Event, exclude: &Exclude) {
         if exclude.contains(&full) {
             return;
         }
-        let ino = std::fs::symlink_metadata(&full)
-            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
-            .unwrap_or(0);
-
+        // A directory on another filesystem -- a mount, or a btrfs subvolume
+        // created just now -- is listed but not followed: its inode numbers
+        // belong to that filesystem and would displace ours in the index.
+        let meta = std::fs::symlink_metadata(&full).ok();
+        let ours = meta
+            .as_ref()
+            .is_some_and(|m| std::os::unix::fs::MetadataExt::dev(m) == root_dev);
+        let ino = match &meta {
+            Some(m) if ours => std::os::unix::fs::MetadataExt::ino(m),
+            _ => 0,
+        };
         let id = ix.add(parent, &ev.name, ev.is_dir(), ino);
-        if ev.is_dir() {
+        if ev.is_dir() && ours {
             scan::scan_subtree(ix, id, &full, 0, exclude);
         }
     } else if ev.is_delete() {
@@ -718,6 +736,9 @@ fn selftest(root: &str) {
         eprintln!("selftest: must run as root");
         std::process::exit(1);
     }
+    let root_dev = std::fs::metadata(root)
+        .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+        .unwrap_or(0);
     let mut watcher = match watch::Watcher::new(root) {
         Ok(w) => w,
         Err(e) => {
@@ -756,7 +777,7 @@ fn selftest(root: &str) {
         }
         if let Ok(events) = watcher.read_events() {
             for ev in &events {
-                apply(&mut ix, ev, &Exclude::new());
+                apply(&mut ix, ev, &Exclude::new(), root_dev);
                 applied += 1;
             }
         }

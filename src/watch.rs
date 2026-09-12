@@ -99,6 +99,57 @@ pub struct Watcher {
     buf: Vec<u8>,
 }
 
+/// The mount point `path` sits on, from /proc/self/mountinfo.
+fn mount_point_of(path: &[u8]) -> Option<Vec<u8>> {
+    longest_mount(&std::fs::read("/proc/self/mountinfo").ok()?, path)
+}
+
+/// The longest mount point containing `path`. Field 5 of a mountinfo line is
+/// the mount point, with space, tab, newline and backslash written as octal
+/// escapes.
+fn longest_mount(mountinfo: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+    let mut best: Option<Vec<u8>> = None;
+    for line in mountinfo.split(|&b| b == b'\n') {
+        let Some(field) = line.split(|&b| b == b' ').nth(4) else {
+            continue;
+        };
+        let mp = unescape_mount(field);
+        if under(path, &mp) && best.as_ref().is_none_or(|b| mp.len() > b.len()) {
+            best = Some(mp);
+        }
+    }
+    best
+}
+
+fn under(path: &[u8], mount: &[u8]) -> bool {
+    mount == b"/"
+        || path == mount
+        || (path.starts_with(mount) && path.get(mount.len()) == Some(&b'/'))
+}
+
+fn unescape_mount(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        let octal = (field[i] == b'\\')
+            .then(|| field.get(i + 1..i + 4))
+            .flatten()
+            .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)))
+            .map(|d| (d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+        match octal {
+            Some(b) => {
+                out.push(b);
+                i += 4;
+            }
+            None => {
+                out.push(field[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 impl Watcher {
     /// Mark an entire filesystem. `mount` may be any path on it.
     pub fn new(mount: &str) -> io::Result<Self> {
@@ -123,22 +174,44 @@ impl Watcher {
 
         let cpath = std::ffi::CString::new(mount).unwrap();
         let mask = FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_ONDIR;
-        let rc = unsafe {
+        let mark = |c: &std::ffi::CString| unsafe {
             fanotify_mark(
                 fd,
                 FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
                 mask,
                 libc::AT_FDCWD,
-                cpath.as_ptr(),
+                c.as_ptr(),
             )
         };
+        let mut rc = mark(&cpath);
+        if rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EXDEV) {
+            // A btrfs subvolume carries its own device number, and the kernel
+            // refuses a filesystem mark on a path that is not on the
+            // filesystem's own device. One mark covers the whole superblock,
+            // subvolumes included, so mark the containing mount instead; the
+            // device check in resolve_handle keeps only this tree's events.
+            if let Some(mp) = mount_point_of(mount.as_bytes()) {
+                if mp != cpath.as_bytes() {
+                    if let Ok(c) = std::ffi::CString::new(mp) {
+                        rc = mark(&c);
+                        if rc >= 0 {
+                            eprintln!(
+                                "spoor: {} is a subvolume; watching its mount {}",
+                                mount,
+                                c.to_string_lossy()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if rc < 0 {
             let e = io::Error::last_os_error();
             unsafe { libc::close(fd) };
             let hint = match e.raw_os_error() {
                 Some(libc::EXDEV) => {
-                    " -- fanotify rejects this path as a filesystem mark (a btrfs \
-                     subvolume on kernels before 6.8 does this)"
+                    " -- fanotify refuses a filesystem mark on this path (a btrfs \
+                     subvolume), and its mount point could not be marked either"
                 }
                 Some(libc::ENODEV) | Some(libc::EOPNOTSUPP) => {
                     " -- this filesystem does not support fanotify file handles"
@@ -413,6 +486,21 @@ mod tests {
 
     fn by_type(fh: &FileHandle, _off: usize) -> (u64, Option<Vec<u8>>) {
         (fh.handle_type as u64, None)
+    }
+
+    #[test]
+    fn mount_points_come_from_mountinfo() {
+        let info = b"25 30 0:23 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+             31 25 0:41 / /mnt/disk\\040two rw shared:9 - btrfs /dev/sdb1 rw\n\
+             32 25 0:42 / /mnt/disk rw shared:9 - btrfs /dev/sdc1 rw\n";
+        let m = |p: &str| longest_mount(info, p.as_bytes()).map(|v| String::from_utf8(v).unwrap());
+        assert_eq!(m("/mnt/disk/sub/a").as_deref(), Some("/mnt/disk"));
+        assert_eq!(m("/mnt/disk two/x").as_deref(), Some("/mnt/disk two"));
+        assert_eq!(m("/mnt/diskother").as_deref(), Some("/"));
+        assert_eq!(m("/home/alice").as_deref(), Some("/"));
+        assert_eq!(longest_mount(b"", b"/home"), None);
+        assert_eq!(unescape_mount(b"/a\\040b"), b"/a b".to_vec());
+        assert_eq!(unescape_mount(b"/plain\\09"), b"/plain\\09".to_vec());
     }
 
     #[test]

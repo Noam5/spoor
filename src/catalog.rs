@@ -18,6 +18,9 @@ pub type Exclude = HashSet<PathBuf>;
 
 pub struct Part {
     pub root: String,
+    /// The device its filesystem reports. A directory from any other device
+    /// (a mount, a btrfs subvolume) is listed but never followed.
+    pub dev: u64,
     pub index: RwLock<Index>,
     /// Events applied while a reconciliation walk of this part runs, kept for
     /// replay onto the fresh index. Pushed and taken only under the index write
@@ -40,6 +43,9 @@ impl Catalog {
             parts: parts
                 .into_iter()
                 .map(|(root, ix)| Part {
+                    dev: std::fs::metadata(&root)
+                        .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+                        .unwrap_or(0),
                     root,
                     index: RwLock::new(ix),
                     capture: Mutex::new(None),

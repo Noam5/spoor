@@ -285,7 +285,7 @@ impl Index {
                         let e = &mut self.entries[k as usize];
                         e.alive = true;
                         e.is_dir = is_dir;
-                        if is_dir {
+                        if is_dir && ino != 0 {
                             self.dir_ino.insert(ino, k);
                         }
                         return k;
@@ -314,7 +314,13 @@ impl Index {
             self.children.entry(parent).or_default().push(id);
         }
         if is_dir {
-            self.dir_ino.insert(ino, id);
+            // Inode 0 means "not part of this tree": another filesystem, or a
+            // btrfs subvolume, whose inode numbers start again from the same
+            // values as ours and would otherwise displace our directories
+            // here. Such a directory is listed, but no event resolves to it.
+            if ino != 0 {
+                self.dir_ino.insert(ino, id);
+            }
             self.children.entry(id).or_default();
         }
         id
@@ -1983,6 +1989,21 @@ mod tests {
             };
             assert_eq!(ix.search_opts("^σοφια", 10, &rx).unwrap(), sofia);
         }
+    }
+
+    #[test]
+    fn a_subvolume_cannot_take_the_roots_inode() {
+        let mut ix = Index::new();
+        // on btrfs both the mount root and a subvolume inside it report 256
+        let root = ix.add(NO_PARENT, "/mnt/disk", true, 256);
+        ix.set_root(root);
+        let sub = ix.add(root, "sub", true, 0); // the walk marks it foreign
+        assert_eq!(ix.dir_by_ino(256), Some(root));
+        assert_ne!(ix.dir_by_ino(256), Some(sub));
+        ix.add(root, "sub", true, 0); // nor on a second sighting
+        assert_eq!(ix.dir_by_ino(256), Some(root));
+        assert_eq!(ix.dir_by_ino(0), None);
+        assert_eq!(ix.search("sub", 10), vec!["/mnt/disk/sub"]);
     }
 
     #[test]
