@@ -21,6 +21,8 @@ sed 's|@BIN@|/usr/bin/spoor|' packaging/org.kde.spoor.service.in \
 sed 's|@BIN@|/usr/bin/spoor|' packaging/org.spoor.configure.policy.in \
     | install -Dm644 /dev/stdin "$ROOT/usr/share/polkit-1/actions/org.spoor.configure.policy"
 for f in README.md LICENSE-MIT LICENSE-APACHE; do install -Dm644 "$f" "$ROOT/usr/share/doc/spoor/$f"; done
+# /usr/share/icons/hicolor/index.theme belongs to hicolor-icon-theme; the
+# package only adds its own icon there.
 install -Dm644 packaging/spoor.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/spoor.svg"
 install -Dm644 packaging/spoor.1 "$ROOT/usr/share/man/man1/spoor.1"
 gzip -9nf "$ROOT/usr/share/man/man1/spoor.1"

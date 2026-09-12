@@ -19,6 +19,9 @@ install:
 	    $(DESTDIR)$(PREFIX)/share/applications/spoor-gui.desktop
 	install -Dm644 packaging/spoor.svg \
 	    $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/spoor.svg
+	@test -f $(DESTDIR)$(PREFIX)/share/icons/hicolor/index.theme || \
+	    install -Dm644 packaging/hicolor-index.theme \
+	        $(DESTDIR)$(PREFIX)/share/icons/hicolor/index.theme
 	-gtk-update-icon-cache -qtf $(DESTDIR)$(PREFIX)/share/icons/hicolor 2>/dev/null
 	install -Dm644 packaging/spoor.1 $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1
 	gzip -9nf $(DESTDIR)$(PREFIX)/share/man/man1/spoor.1

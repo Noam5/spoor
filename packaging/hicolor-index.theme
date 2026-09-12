@@ -1,0 +1,15 @@
+# Installed only when the prefix has no hicolor theme of its own -- under
+# /usr/local there usually is none, and the icon-theme spec ignores a
+# directory without this file, so the icon would never be found.
+[Icon Theme]
+Name=Hicolor
+Comment=Fallback icon theme
+Hidden=true
+Directories=scalable/apps
+
+[scalable/apps]
+Size=48
+MinSize=8
+MaxSize=512
+Type=Scalable
+Context=Applications
