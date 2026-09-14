@@ -6,6 +6,8 @@ on:
 jobs:
   deb:
     strategy:
+      # Let the other architecture finish, so one failure shows every problem.
+      fail-fast: false
       matrix:
         # 22.04, not newer: build-deb.sh derives the package's dependencies
         # from the binary, so building against a newer glibc would make the

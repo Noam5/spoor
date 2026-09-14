@@ -60,7 +60,7 @@ struct FileHandle {
 
 extern "C" {
     fn fanotify_init(flags: u32, event_f_flags: u32) -> i32;
-    fn fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: *const i8) -> i32;
+    fn fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: *const libc::c_char) -> i32;
     fn open_by_handle_at(mount_fd: i32, handle: *const FileHandle, flags: i32) -> i32;
 }
 
