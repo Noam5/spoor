@@ -1,0 +1,92 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  deb:
+    strategy:
+      matrix:
+        # 22.04, not newer: build-deb.sh derives the package's dependencies
+        # from the binary, so building against a newer glibc would make the
+        # package uninstallable on Ubuntu 22.04 and Debian 12.
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but Cargo.toml says $version"
+            exit 1
+          fi
+      - name: GTK development files
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+      - name: Unit tests
+        run: cargo test --release --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Live fanotify self-test (needs root)
+        run: sudo ./target/release/spoor selftest --root "$RUNNER_TEMP"
+      - name: Debian package
+        run: make deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/deb/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: deb
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          heading=$(awk -v v="$version" '$1 == "##" && $2 == v { print; exit }' CHANGELOG.md)
+          if [ -z "$heading" ]; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          case $heading in *unreleased*)
+            echo "::error::CHANGELOG.md still marks $version unreleased"
+            exit 1
+          esac
+          awk -v h="$heading" '$0 == h { on = 1; next } /^## / { on = 0 } on' \
+              CHANGELOG.md > notes.md
+          cat >> notes.md <<'EOF'
+
+          ### Installing
+
+          On Ubuntu 22.04+, Debian 12+ and distributions based on them, download
+          the package for your machine (`amd64` for most PCs) and run:
+
+              sudo apt install ./spoor_*_amd64.deb
+
+          To check the download: `sha256sum --check --ignore-missing SHA256SUMS`
+          EOF
+      - name: Checksums
+        run: cd dist && sha256sum *.deb > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "spoor ${GITHUB_REF_NAME#v}" --notes-file notes.md \
+              dist/*.deb dist/SHA256SUMS

@@ -19,13 +19,28 @@ permissions first.
 
 ## Installing
 
+On Ubuntu 22.04 or newer, Debian 12 or newer, and systems based on them (Linux
+Mint, Pop!_OS and others), download the package from the
+[latest release](https://github.com/Noam5/spoor/releases/latest) — `amd64` for
+most PCs, `arm64` for ARM machines — and install it from the folder you saved
+it in:
+
+    sudo apt install ./spoor_*_amd64.deb
+
+The service starts by itself; **File Search** is in your application menu. In
+KDE, Alt+Space searches files too once you log in again.
+
+To remove it, `sudo apt remove spoor`. `sudo apt purge spoor` also deletes the
+index and your folder settings.
+
+### Building it yourself
+
     make build
     sudo make install
     sudo systemctl enable --now spoor
 
-Or build a Debian package with `make deb` and install that. For searching from
-KDE's launcher with Alt+Space, add `make install-krunner`. To remove
-everything, `sudo make uninstall`.
+For searching from KDE's launcher with Alt+Space, add `make install-krunner`.
+To remove everything, `sudo make uninstall`.
 
 ## Using it
 
