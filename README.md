@@ -17,6 +17,15 @@ on a disk at once instead of watching each folder separately. It never shows
 you more than you could see yourself: every result is checked against your own
 permissions first.
 
+### How fast
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark-dark.png">
+  <img alt="Benchmark on a million files: spoor searches faster than plocate and find, shows a new file within half a millisecond where plocate waits for its daily update, and watches the whole disk with one fanotify mark instead of one inotify watch per folder" src="docs/benchmark-light.png">
+</picture>
+
+[bench/](bench/README.md) has what was measured and how to run it yourself.
+
 ## Installing
 
 On Ubuntu 22.04 or newer, Debian 12 or newer, and systems based on them (Linux
