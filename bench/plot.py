@@ -237,20 +237,20 @@ def draw_simple(r, theme):
 
     Linear is the honest reading of "how long do I wait", but it flattens
     everything under a second into the baseline, so every bar carries its own
-    number and the caption says which search this is."""
+    number. The caveats live in the README beside the image."""
     t = THEMES[theme]
     plt.rcParams["font.family"] = ["DejaVu Sans"]
-    fig = plt.figure(figsize=(11, 5.4), facecolor=t["surface"])
-    ax = fig.add_axes([0.2, 0.2, 0.775, 0.54])
+    fig = plt.figure(figsize=(11, 4.9), facecolor=t["surface"])
+    ax = fig.add_axes([0.2, 0.16, 0.775, 0.60])
     m, b = r["machine"], r["build"]
     q = r["search"][0]
     fsearch = (r.get("fsearch") or {}).get("search_s", {}).get(q["pattern"])
 
-    fig.text(0.025, 0.93, "Finding one file among a million", color=t["ink"],
+    fig.text(0.025, 0.925, "Finding one file among a million", color=t["ink"],
              fontsize=19, fontweight="bold")
-    fig.text(0.025, 0.875,
-             f"Time to find “{q['pattern']}” by name. {b['entries']:,} files and "
-             f"folders on an {m['filesystem']} disk, {m['cpu'].split('@')[0].strip()}.",
+    fig.text(0.025, 0.862,
+             f"Time to find one file by name. {b['entries']:,} files and folders "
+             f"on an {m['filesystem']} disk, {m['cpu'].split('@')[0].strip()}.",
              color=t["ink2"], fontsize=10.5)
 
     rows = [("spoor", q["spoor_socket_s"], "spoor")]
@@ -282,12 +282,6 @@ def draw_simple(r, theme):
     ax.tick_params(axis="x", colors=t["muted"], length=0, labelsize=9.5)
     ax.tick_params(axis="y", colors=t["ink"], length=0, labelsize=12)
     ax.set_xlabel("seconds", color=t["muted"], fontsize=9.5, labelpad=6)
-
-    fig.text(0.025, 0.035,
-             "A search with few matches, where an index pays off most. With tens of "
-             "thousands of matches the gap narrows,\nand FSearch or fd can come out "
-             "ahead — bench/ has every measurement, including the ones spoor loses.",
-             color=t["muted"], fontsize=9, linespacing=1.6)
 
     out = os.path.join(DOCS, f"benchmark-{theme}.png")
     fig.savefig(out, dpi=110, facecolor=t["surface"])
