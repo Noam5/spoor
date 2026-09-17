@@ -3,6 +3,11 @@
 Instant file-name search for Linux. Type a few letters; the results are
 already there.
 
+Inspired by [Everything](https://www.voidtools.com/) on Windows, which stays
+instant by reading the filesystem's own record of what changed. spoor does the
+same on Linux, where that record does not exist, by having the kernel report
+every change as it happens.
+
 ![The spoor window: a search box above results showing name, folder, size and date](docs/screenshot.png)
 
 ## How it works
