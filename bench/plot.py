@@ -108,7 +108,7 @@ def bars(ax, t, rows, height=0.62):
     ax.set_xlim(lo, hi)  # barh autoscales; keep the axis as styled
 
 
-def draw(r, theme):
+def draw_detail(r, theme):
     t = THEMES[theme]
     plt.rcParams["font.family"] = ["DejaVu Sans"]
     fig = plt.figure(figsize=(12.5, 15.5), facecolor=t["surface"])
@@ -226,6 +226,69 @@ def draw(r, theme):
     heading(ax, t, "Getting started",
             "Building an index from nothing, and being ready to hear about changes.")
 
+    out = os.path.join(DOCS, f"benchmark-detail-{theme}.png")
+    fig.savefig(out, dpi=110, facecolor=t["surface"])
+    plt.close(fig)
+    print(out)
+
+
+def draw_simple(r, theme):
+    """The README's headline: one selective search, on a plain linear scale.
+
+    Linear is the honest reading of "how long do I wait", but it flattens
+    everything under a second into the baseline, so every bar carries its own
+    number and the caption says which search this is."""
+    t = THEMES[theme]
+    plt.rcParams["font.family"] = ["DejaVu Sans"]
+    fig = plt.figure(figsize=(11, 5.4), facecolor=t["surface"])
+    ax = fig.add_axes([0.2, 0.2, 0.775, 0.54])
+    m, b = r["machine"], r["build"]
+    q = r["search"][0]
+    fsearch = (r.get("fsearch") or {}).get("search_s", {}).get(q["pattern"])
+
+    fig.text(0.025, 0.93, "Finding one file among a million", color=t["ink"],
+             fontsize=19, fontweight="bold")
+    fig.text(0.025, 0.875,
+             f"Time to find “{q['pattern']}” by name. {b['entries']:,} files and "
+             f"folders on an {m['filesystem']} disk, {m['cpu'].split('@')[0].strip()}.",
+             color=t["ink2"], fontsize=10.5)
+
+    rows = [("spoor", q["spoor_socket_s"], "spoor")]
+    if fsearch:
+        rows.append(("FSearch", fsearch, "fsearch"))
+    rows += [("plocate", q["plocate_s"], "plocate")]
+    if "fd_s" in q:
+        rows.append(("fd", q["fd_s"], "walk"))
+    rows += [("bfs", q["bfs_s"], "walk"), ("find", q["find_s"], "walk")]
+    rows.sort(key=lambda row: row[1])
+    slowest = max(v for _, v, _ in rows)
+
+    ax.set_facecolor(t["surface"])
+    ax.set_xlim(0, slowest * 1.30)
+    for i, (label, v, key) in enumerate(rows):
+        ax.barh(i, v, height=0.62, color=t[key])
+        note = f"{fmt(v)}      too fast to draw at this scale"
+        if i:
+            note = f"{fmt(v)}      {v / rows[0][1]:,.0f}× slower"
+        ax.annotate(note, (v, i), xytext=(7, 0), textcoords="offset points",
+                    va="center", color=t["ink2"], fontsize=10)
+    ax.set_yticks(range(len(rows)), [r[0] for r in rows])
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax.grid(axis="x", color=t["grid"], linewidth=1)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "bottom"):
+        ax.spines[side].set_visible(False)
+    ax.spines["left"].set_color(t["axis"])
+    ax.tick_params(axis="x", colors=t["muted"], length=0, labelsize=9.5)
+    ax.tick_params(axis="y", colors=t["ink"], length=0, labelsize=12)
+    ax.set_xlabel("seconds", color=t["muted"], fontsize=9.5, labelpad=6)
+
+    fig.text(0.025, 0.035,
+             "A search with few matches, where an index pays off most. With tens of "
+             "thousands of matches the gap narrows,\nand FSearch or fd can come out "
+             "ahead — bench/ has every measurement, including the ones spoor loses.",
+             color=t["muted"], fontsize=9, linespacing=1.6)
+
     out = os.path.join(DOCS, f"benchmark-{theme}.png")
     fig.savefig(out, dpi=110, facecolor=t["surface"])
     plt.close(fig)
@@ -236,7 +299,8 @@ def main():
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results.json")
     r = json.load(open(path))
     for theme in THEMES:
-        draw(r, theme)
+        draw_simple(r, theme)
+        draw_detail(r, theme)
 
 
 if __name__ == "__main__":

@@ -21,12 +21,12 @@ permissions first.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark-dark.png">
-  <img alt="Benchmark on a million files: spoor finds one file by name in 0.35 ms where FSearch takes 233 ms and find 3.6 s; a new file is searchable about a millisecond after it is saved, while plocate waits for its daily update; and one fanotify mark covers the whole disk in 27 microseconds where inotify needs 48,958 watches and 2.3 seconds" src="docs/benchmark-light.png">
+  <img alt="Finding one file by name among a million: spoor takes 348 microseconds, plocate 16.7 ms, FSearch 233 ms, fd 1.1 s, bfs 2 s, find 3.6 s" src="docs/benchmark-light.png">
 </picture>
 
-A million files on one disk: spoor against plocate, FSearch, find, fd, bfs, and
-the other ways to watch a filesystem. [bench/](bench/README.md) has what was
-measured, how to run it yourself, and where spoor comes off worse.
+[bench/](bench/README.md) has the rest: searches that match tens of thousands
+of files, how soon a new file turns up, what watching a disk costs, and where
+spoor comes off worse.
 
 ## Installing
 

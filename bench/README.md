@@ -5,9 +5,11 @@ other ways to hear that a file has changed. Everything is measured on one
 synthetic tree, so anyone can check the numbers.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../docs/benchmark-dark.png">
-  <img alt="Benchmark results" src="../docs/benchmark-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="../docs/benchmark-detail-dark.png">
+  <img alt="Every benchmark result: search times for five queries, how soon a new file shows up, what each watcher costs, and startup" src="../docs/benchmark-detail-light.png">
 </picture>
+
+The README shows one headline number from this; everything measured is above.
 
 ## What is compared
 
