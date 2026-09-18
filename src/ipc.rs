@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Upper bound on results per request, whatever the client asks for.
-const MAX_LIMIT: usize = 100_000;
+pub const MAX_LIMIT: usize = 100_000;
 /// Any local user can connect, so bound what one can cost: at most this many
 /// requests in flight (further connections are refused, not given a thread),
 /// a request line of at most MAX_REQUEST bytes, and timeouts on both sides.

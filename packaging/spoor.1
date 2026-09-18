@@ -4,6 +4,8 @@ spoor \- instant file-name search
 .SH SYNOPSIS
 .B spoor query
 .RI [ options ] " pattern" ...
+.RI [ -exec " command " [ argument ...]
+.BR {} " " ;| + ]
 .br
 .B spoor gui
 .RI [ --socket
@@ -86,6 +88,30 @@ At most N results (default 100).
 End each result with a NUL instead of a newline, for names containing
 newlines. Pairs with
 .BR "xargs -0" .
+.TP
+.BI -exec " command " [ argument "...] {} " ;
+Run the command on each result instead of printing it, with
+.B {}
+replaced by the name, as in
+.BR find (1).
+The command is started directly, never through a shell, so a name holding
+spaces, quotes or newlines needs no escaping. Note that the shell eats a bare
+semicolon: write
+.BR \e; .
+.TP
+.BI -exec " command " [ argument "...] {} " +
+The same, but one run carrying as many names as a command line holds, which is
+much faster for many results. The
+.B {}
+must come last. Unlike
+.BR find (1),
+spoor exits non-zero if any run of the command failed.
+.IP
+With
+.BR -exec ,
+every match is acted on rather than the first 100; pass
+.B --limit
+to bound it.
 .SS Daemon options
 .TP
 .BI --config " PATH"
@@ -148,6 +174,12 @@ Names that may contain anything at all.
 .TP
 .B spoor query --regex '^IMG_[0-9]+\e.jpg$'
 A regular expression over names.
+.TP
+.B spoor query invoice -exec cp {} ~/backup/ \e;
+Copy every match, one run of cp per file.
+.TP
+.B spoor query .tmp -exec rm {} +
+Remove every match, in as few runs of rm as possible.
 .SH SEE ALSO
 .BR locate (1),
 .BR updatedb (8),

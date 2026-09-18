@@ -90,6 +90,18 @@ Name still copy text, one file per line.
 Preferences (Ctrl+P) has the rest: search as you type, hidden files, and how
 many results to show.
 
+### From the command line
+
+`spoor query invoice` prints matching paths. To act on them, `-exec` works as
+it does in find:
+
+    spoor query invoice -exec cp {} ~/backup/ \;   # one run of cp per file
+    spoor query .tmp    -exec rm {} +              # one run of rm for all
+
+The command is started directly, never through a shell, so names with spaces,
+quotes or newlines need no quoting of their own. `-exec` acts on every match
+rather than the first hundred, and spoor exits non-zero if any run failed.
+
 ## Choosing which folders to index
 
 Preferences lists the folders that are indexed, folders to leave out, and

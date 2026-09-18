@@ -12,6 +12,7 @@
 
 mod catalog;
 mod config;
+mod exec;
 mod gui;
 mod index;
 mod ipc;
@@ -134,10 +135,21 @@ fn main() {
             }
         }
         "query" => {
+            // The -exec clause first: its command may hold anything, and the
+            // flags below must not try to read it.
+            let (args, exec) = match exec::split(&args) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("spoor: {}", e);
+                    std::process::exit(2);
+                }
+            };
             let sock = arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCK.to_string());
+            // A command is run on everything that matches, not on the first
+            // screenful: printing has a sensible default, acting does not.
             let limit: usize = arg_value(&args, "--limit")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100);
+                .unwrap_or(if exec.is_some() { ipc::MAX_LIMIT } else { 100 });
             let opts = SearchOpts {
                 match_case: has_flag(&args, "--case"),
                 regex: has_flag(&args, "--regex"),
@@ -155,6 +167,16 @@ fn main() {
             let null = has_flag(&args, "--null");
             match query::search(&sock, &pattern, limit, &opts) {
                 Ok(hits) => {
+                    if let Some(exec) = exec {
+                        // Say so rather than act on a silently truncated list.
+                        if hits.len() >= limit {
+                            eprintln!(
+                                "spoor: stopped at {} results; the command ran on those",
+                                hits.len()
+                            );
+                        }
+                        std::process::exit(exec.run(&hits));
+                    }
                     // Raw bytes, as locate prints them: a name need not be UTF-8.
                     // --null separates with NUL, for names containing newlines.
                     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -228,6 +250,7 @@ fn main() {
             );
             eprintln!("  spoor query <pattern> [--limit N] [--case] [--regex] [--path]");
             eprintln!("                        [--files|--folders] [--no-hidden] [--null]");
+            eprintln!("                        [-exec CMD [ARG]... {{}} ;|+]  (as in find)");
             eprintln!("  spoor configure [FILE|-]  (root: install index settings and restart)");
             eprintln!("  spoor stats");
             eprintln!("  spoor --version");

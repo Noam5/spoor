@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Command line
+
+* `spoor query ... -exec command {} ;` and `-exec command {} +` run a command
+  on the results, as find does, without a shell in the way. Every match is
+  acted on, not the first hundred, and the exit status reports a command that
+  failed.
+
 ### Window
 
 * Shift-click and Ctrl-click select several results at once, and every action —
