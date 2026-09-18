@@ -383,7 +383,10 @@ fn submenu(bar: &MenuBar, label: &str) -> Menu {
 fn action_hint(menu: &Menu, label: &str, spec: &str, f: impl Fn() + 'static) {
     let mi = MenuItem::with_mnemonic(label);
     let (key, mods) = gtk::accelerator_parse(spec);
-    if let Some(l) = mi.child().and_then(|c| c.downcast::<gtk::AccelLabel>().ok()) {
+    if let Some(l) = mi
+        .child()
+        .and_then(|c| c.downcast::<gtk::AccelLabel>().ok())
+    {
         l.set_accel(key, mods);
     }
     mi.connect_activate(move |_| f());
@@ -457,11 +460,15 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     let edit = submenu(bar, "_Edit");
     {
         let ui = ui.clone();
-        action_hint(&edit, "_Copy", "<Control>c", move || clip_selected(&ui, false));
+        action_hint(&edit, "_Copy", "<Control>c", move || {
+            clip_selected(&ui, false)
+        });
     }
     {
         let ui = ui.clone();
-        action_hint(&edit, "Cu_t", "<Control>x", move || clip_selected(&ui, true));
+        action_hint(&edit, "Cu_t", "<Control>x", move || {
+            clip_selected(&ui, true)
+        });
     }
     {
         let ui = ui.clone();
@@ -479,13 +486,18 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     edit.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action_hint(&edit, "Move to _Trash", "Delete", move || trash_selected(&ui));
+        action_hint(&edit, "Move to _Trash", "Delete", move || {
+            trash_selected(&ui)
+        });
     }
     {
         let ui = ui.clone();
-        action_hint(&edit, "_Delete Permanently…", "<Shift>Delete", move || {
-            delete_selected(&ui)
-        });
+        action_hint(
+            &edit,
+            "_Delete Permanently…",
+            "<Shift>Delete",
+            move || delete_selected(&ui),
+        );
     }
     edit.append(&SeparatorMenuItem::new());
     {
@@ -586,16 +598,22 @@ fn build_context_menu(ui: &Rc<Ui>) -> Menu {
     }
     {
         let ui = ui.clone();
-        action(&menu, "Open Containing _Folder", None, move || open_folders(&ui));
+        action(&menu, "Open Containing _Folder", None, move || {
+            open_folders(&ui)
+        });
     }
     menu.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action_hint(&menu, "_Copy", "<Control>c", move || clip_selected(&ui, false));
+        action_hint(&menu, "_Copy", "<Control>c", move || {
+            clip_selected(&ui, false)
+        });
     }
     {
         let ui = ui.clone();
-        action_hint(&menu, "Cu_t", "<Control>x", move || clip_selected(&ui, true));
+        action_hint(&menu, "Cu_t", "<Control>x", move || {
+            clip_selected(&ui, true)
+        });
     }
     {
         let ui = ui.clone();
@@ -608,13 +626,18 @@ fn build_context_menu(ui: &Rc<Ui>) -> Menu {
     menu.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action_hint(&menu, "Move to _Trash", "Delete", move || trash_selected(&ui));
+        action_hint(&menu, "Move to _Trash", "Delete", move || {
+            trash_selected(&ui)
+        });
     }
     {
         let ui = ui.clone();
-        action_hint(&menu, "_Delete Permanently…", "<Shift>Delete", move || {
-            delete_selected(&ui)
-        });
+        action_hint(
+            &menu,
+            "_Delete Permanently…",
+            "<Shift>Delete",
+            move || delete_selected(&ui),
+        );
     }
     menu.append(&SeparatorMenuItem::new());
     {
@@ -1145,7 +1168,9 @@ fn remove_selected(ui: &Ui, permanent: bool) {
         let Some(iter) = r.path().and_then(|p| ui.store.iter(&p)) else {
             continue;
         };
-        let Some(path) = path_at(ui, &iter) else { continue };
+        let Some(path) = path_at(ui, &iter) else {
+            continue;
+        };
         let result = if !permanent {
             gio::File::for_path(&path)
                 .trash(None::<&gio::Cancellable>)
@@ -1164,7 +1189,11 @@ fn remove_selected(ui: &Ui, permanent: bool) {
             Err(e) => failure = Some(e),
         }
     }
-    let verb = if permanent { "deleted" } else { "moved to trash" };
+    let verb = if permanent {
+        "deleted"
+    } else {
+        "moved to trash"
+    };
     // One failure is worth reporting even when the rest went.
     ui.status.set_text(&match (done, failure) {
         (0, Some(e)) => format!("could not delete: {}", e),
