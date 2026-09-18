@@ -18,9 +18,10 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     AccelFlags, AccelGroup, AppChooserDialog, Application, ApplicationWindow, Box as GtkBox,
-    Button, CellRendererText, CheckButton, CheckMenuItem, Dialog, DialogFlags, Entry,
-    FileChooserAction, FileChooserDialog, Label, ListStore, Menu, MenuBar, MenuItem, Orientation,
-    PolicyType, RadioMenuItem, ResponseType, ScrolledWindow, SeparatorMenuItem, SpinButton,
+    Button, ButtonsType, CellRendererText, CheckButton, CheckMenuItem, Dialog, DialogFlags, Entry,
+    FileChooserAction, FileChooserDialog, Label, ListStore, Menu, MenuBar, MenuItem, MessageDialog,
+    MessageType, Orientation, PolicyType, RadioMenuItem, ResponseType, ScrolledWindow,
+    SelectionMode, SeparatorMenuItem, SpinButton, TargetEntry, TargetFlags, TreeRowReference,
     TreeView, TreeViewColumn,
 };
 use std::cell::{Cell, RefCell};
@@ -202,6 +203,9 @@ fn build(app: &Application, socket: String) {
         i64::static_type(),
     ]);
     let tree = TreeView::with_model(&store);
+    // Shift and Ctrl extend the selection, as in a file manager. Every action
+    // below works on the whole selection, not just the row that was clicked.
+    tree.selection().set_mode(SelectionMode::Multiple);
     tree.set_headers_visible(true);
     tree.set_fixed_height_mode(true);
     // Click a header to sort; results arrive in index order until then.
@@ -277,8 +281,11 @@ fn build(app: &Application, socket: String) {
     // Double-click or Enter anywhere on a row opens the file, whichever column.
     {
         let ui = ui.clone();
-        tree.connect_row_activated(move |_, path, _| {
-            if let Some(p) = ui.store.iter(path).and_then(|it| path_at(&ui, &it)) {
+        tree.connect_row_activated(move |tv, path, _| {
+            // Enter on one of several selected rows opens all of them.
+            if tv.selection().count_selected_rows() > 1 && tv.selection().path_is_selected(path) {
+                open_selected(&ui);
+            } else if let Some(p) = ui.store.iter(path).and_then(|it| path_at(&ui, &it)) {
                 open(&p);
             }
         });
@@ -295,11 +302,41 @@ fn build(app: &Application, socket: String) {
             }
             let (x, y) = ev.position();
             if let Some((Some(path), _, _, _)) = tv.path_at_pos(x as i32, y as i32) {
-                // Right-click selects the row under the pointer first, so the
-                // menu always acts on what was clicked.
-                tv.selection().select_path(&path);
+                // Right-click selects the row under the pointer, so the menu
+                // always acts on what was clicked -- unless that row is part
+                // of a selection, which the menu should act on as a whole.
+                if !tv.selection().path_is_selected(&path) {
+                    tv.selection().unselect_all();
+                    tv.selection().select_path(&path);
+                }
                 tv.grab_focus();
                 menu.popup_at_pointer(None);
+            }
+            glib::Propagation::Stop
+        });
+    }
+    {
+        // Ctrl+C, Ctrl+X and Delete belong to the list: bound here rather than
+        // to the window, so that in the search box they still edit the text.
+        let ui = ui.clone();
+        tree.connect_key_press_event(move |_, ev| {
+            use gtk::gdk::keys::constants as key;
+            let state = ev.state();
+            let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            let k = ev.keyval();
+            if k == key::Delete || k == key::KP_Delete {
+                if shift {
+                    delete_selected(&ui);
+                } else {
+                    trash_selected(&ui);
+                }
+            } else if ctrl && (k == key::c || k == key::C) {
+                clip_selected(&ui, false);
+            } else if ctrl && (k == key::x || k == key::X) {
+                clip_selected(&ui, true);
+            } else {
+                return glib::Propagation::Proceed;
             }
             glib::Propagation::Stop
         });
@@ -309,7 +346,7 @@ fn build(app: &Application, socket: String) {
         let menu = context.clone();
         let ui = ui.clone();
         tree.connect_popup_menu(move |_| {
-            if selected_path(&ui).is_none() {
+            if selected_paths(&ui).is_empty() {
                 return false;
             }
             menu.popup_at_pointer(None);
@@ -318,11 +355,7 @@ fn build(app: &Application, socket: String) {
     }
     {
         let ui = ui.clone();
-        open_folder.connect_clicked(move |_| {
-            if let Some(p) = selected_path(&ui) {
-                open(parent_dir(&p));
-            }
-        });
+        open_folder.connect_clicked(move |_| open_folders(&ui));
     }
 
     show_connection(&ui);
@@ -343,6 +376,18 @@ fn submenu(bar: &MenuBar, label: &str) -> Menu {
     top.set_submenu(Some(&menu));
     bar.append(&top);
     menu
+}
+
+/// A menu item whose shortcut is handled by the results list, not by an
+/// accelerator group: the label shows the key, the list decides when it acts.
+fn action_hint(menu: &Menu, label: &str, spec: &str, f: impl Fn() + 'static) {
+    let mi = MenuItem::with_mnemonic(label);
+    let (key, mods) = gtk::accelerator_parse(spec);
+    if let Some(l) = mi.child().and_then(|c| c.downcast::<gtk::AccelLabel>().ok()) {
+        l.set_accel(key, mods);
+    }
+    mi.connect_activate(move |_| f());
+    menu.append(&mi);
 }
 
 fn action(menu: &Menu, label: &str, accel: Option<(&AccelGroup, &str)>, f: impl Fn() + 'static) {
@@ -376,11 +421,7 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     let file = submenu(bar, "_File");
     {
         let ui = ui.clone();
-        action(&file, "_Open", None, move || {
-            if let Some(p) = selected_path(&ui) {
-                open(&p);
-            }
-        });
+        action(&file, "_Open", None, move || open_selected(&ui));
     }
     {
         let ui = ui.clone();
@@ -392,11 +433,7 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
             &file,
             "Open Containing _Folder",
             Some((accel, "<Control>Return")),
-            move || {
-                if let Some(p) = selected_path(&ui) {
-                    open(parent_dir(&p));
-                }
-            },
+            move || open_folders(&ui),
         );
     }
     file.append(&SeparatorMenuItem::new());
@@ -420,6 +457,14 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     let edit = submenu(bar, "_Edit");
     {
         let ui = ui.clone();
+        action_hint(&edit, "_Copy", "<Control>c", move || clip_selected(&ui, false));
+    }
+    {
+        let ui = ui.clone();
+        action_hint(&edit, "Cu_t", "<Control>x", move || clip_selected(&ui, true));
+    }
+    {
+        let ui = ui.clone();
         action(
             &edit,
             "Copy _Path",
@@ -430,6 +475,17 @@ fn build_menus(ui: &Rc<Ui>, bar: &MenuBar, accel: &AccelGroup) {
     {
         let ui = ui.clone();
         action(&edit, "Copy _Name", None, move || copy_selected(&ui, true));
+    }
+    edit.append(&SeparatorMenuItem::new());
+    {
+        let ui = ui.clone();
+        action_hint(&edit, "Move to _Trash", "Delete", move || trash_selected(&ui));
+    }
+    {
+        let ui = ui.clone();
+        action_hint(&edit, "_Delete Permanently…", "<Shift>Delete", move || {
+            delete_selected(&ui)
+        });
     }
     edit.append(&SeparatorMenuItem::new());
     {
@@ -522,11 +578,7 @@ fn build_context_menu(ui: &Rc<Ui>) -> Menu {
     let menu = Menu::new();
     {
         let ui = ui.clone();
-        action(&menu, "_Open", None, move || {
-            if let Some(p) = selected_path(&ui) {
-                open(&p);
-            }
-        });
+        action(&menu, "_Open", None, move || open_selected(&ui));
     }
     {
         let ui = ui.clone();
@@ -534,13 +586,17 @@ fn build_context_menu(ui: &Rc<Ui>) -> Menu {
     }
     {
         let ui = ui.clone();
-        action(&menu, "Open Containing _Folder", None, move || {
-            if let Some(p) = selected_path(&ui) {
-                open(parent_dir(&p));
-            }
-        });
+        action(&menu, "Open Containing _Folder", None, move || open_folders(&ui));
     }
     menu.append(&SeparatorMenuItem::new());
+    {
+        let ui = ui.clone();
+        action_hint(&menu, "_Copy", "<Control>c", move || clip_selected(&ui, false));
+    }
+    {
+        let ui = ui.clone();
+        action_hint(&menu, "Cu_t", "<Control>x", move || clip_selected(&ui, true));
+    }
     {
         let ui = ui.clone();
         action(&menu, "Copy _Path", None, move || copy_selected(&ui, false));
@@ -552,7 +608,13 @@ fn build_context_menu(ui: &Rc<Ui>) -> Menu {
     menu.append(&SeparatorMenuItem::new());
     {
         let ui = ui.clone();
-        action(&menu, "Move to _Trash", None, move || trash_selected(&ui));
+        action_hint(&menu, "Move to _Trash", "Delete", move || trash_selected(&ui));
+    }
+    {
+        let ui = ui.clone();
+        action_hint(&menu, "_Delete Permanently…", "<Shift>Delete", move || {
+            delete_selected(&ui)
+        });
     }
     menu.append(&SeparatorMenuItem::new());
     {
@@ -799,40 +861,218 @@ fn path_at(ui: &Ui, iter: &gtk::TreeIter) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_vec(raw)))
 }
 
-fn selected_path(ui: &Ui) -> Option<PathBuf> {
-    let (_, iter) = ui.tree.selection().selected()?;
-    path_at(ui, &iter)
+/// Every selected row, in the order shown. Shift-click and Ctrl-click can
+/// select many, so this is what the actions work on.
+fn selected_paths(ui: &Ui) -> Vec<PathBuf> {
+    ui.tree
+        .selection()
+        .selected_rows()
+        .0
+        .iter()
+        .filter_map(|p| ui.store.iter(p))
+        .filter_map(|it| path_at(ui, &it))
+        .collect()
+}
+
+/// Opening a whole screenful of files at once is usually a slip of the hand,
+/// and every one of them starts a program, so ask first past this many.
+const OPEN_WITHOUT_ASKING: usize = 10;
+
+fn open_selected(ui: &Rc<Ui>) {
+    let paths = selected_paths(ui);
+    if paths.is_empty() {
+        return;
+    }
+    if paths.len() > OPEN_WITHOUT_ASKING {
+        let dialog = MessageDialog::new(
+            Some(&ui.window),
+            DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
+            MessageType::Question,
+            ButtonsType::YesNo,
+            &format!("Open all {} selected files?", paths.len()),
+        );
+        dialog.connect_response(move |d, resp| {
+            if resp == ResponseType::Yes {
+                for p in &paths {
+                    open(p);
+                }
+            }
+            d.close();
+        });
+        dialog.show_all();
+        return;
+    }
+    for p in &paths {
+        open(p);
+    }
+}
+
+/// One window per folder, however many files are selected inside it.
+fn open_folders(ui: &Ui) {
+    let mut opened: Vec<PathBuf> = Vec::new();
+    for p in selected_paths(ui) {
+        let dir = parent_dir(&p).to_path_buf();
+        if !opened.contains(&dir) {
+            open(&dir);
+            opened.push(dir);
+        }
+    }
 }
 
 /// The clipboard takes text, so a name that is not UTF-8 is copied with its
 /// stray bytes replaced -- the one place a raw name cannot survive.
 fn copy_selected(ui: &Ui, name_only: bool) {
-    let Some(p) = selected_path(ui) else { return };
-    let text = match p.file_name() {
-        Some(n) if name_only => n.to_string_lossy().into_owned(),
-        _ => p.to_string_lossy().into_owned(),
-    };
+    let paths = selected_paths(ui);
+    if paths.is_empty() {
+        return;
+    }
+    // Several selected rows copy as one per line, which is what a shell or a
+    // text editor expects to receive.
+    let text = paths
+        .iter()
+        .map(|p| match p.file_name() {
+            Some(n) if name_only => n.to_string_lossy().into_owned(),
+            _ => p.to_string_lossy().into_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_text(&text);
-    ui.status.set_text(&format!("copied {}", text));
+    ui.status.set_text(&if paths.len() == 1 {
+        format!("copied {}", text)
+    } else {
+        format!(
+            "copied {} {}",
+            paths.len(),
+            if name_only { "names" } else { "paths" }
+        )
+    });
 }
 
 fn open_with(ui: &Ui) {
-    let Some(p) = selected_path(ui) else { return };
-    let file = gio::File::for_path(&p);
+    let paths = selected_paths(ui);
+    let Some(first) = paths.first() else { return };
+    // The dialog offers the applications that suit the first file; they are
+    // then handed the whole selection.
+    let files: Vec<gio::File> = paths.iter().map(gio::File::for_path).collect();
     let dialog = AppChooserDialog::new(
         Some(&ui.window),
         DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
-        &file,
+        &gio::File::for_path(first),
     );
     dialog.connect_response(move |d, resp| {
         if resp == ResponseType::Ok {
             if let Some(app) = d.app_info() {
-                let _ = app.launch(std::slice::from_ref(&file), None::<&gio::AppLaunchContext>);
+                let _ = app.launch(&files, None::<&gio::AppLaunchContext>);
             }
         }
         d.close();
     });
     dialog.show_all();
+}
+
+/// Puts the selected files on the clipboard for a file manager to paste, as a
+/// copy or as a cut. There is no single standard, so all of the usual targets
+/// are offered at once: GNOME's Files, KDE's Dolphin and the others each read
+/// the one they know. The clipboard holds them only while this window is open,
+/// the same as in any other application.
+fn clip_selected(ui: &Ui, cut: bool) {
+    let paths = selected_paths(ui);
+    if paths.is_empty() {
+        return;
+    }
+    let uris: Vec<String> = paths
+        .iter()
+        .map(|p| gio::File::for_path(p).uri().to_string())
+        .collect();
+    // "copy\n<uri>\n<uri>" is what GNOME and Dolphin both understand.
+    let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
+    let uri_list = uris
+        .iter()
+        .map(|u| format!("{}\r\n", u))
+        .collect::<String>();
+    let kde_cut = if cut { "1" } else { "0" }.to_string();
+    let text = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let targets = [
+        TargetEntry::new("x-special/gnome-copied-files", TargetFlags::empty(), 0),
+        TargetEntry::new("text/uri-list", TargetFlags::empty(), 1),
+        TargetEntry::new("application/x-kde-cutselection", TargetFlags::empty(), 2),
+        TargetEntry::new("UTF8_STRING", TargetFlags::empty(), 3),
+    ];
+    let ok = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_with_data(
+        &targets,
+        move |_, selection, info| {
+            let (name, data) = match info {
+                0 => ("x-special/gnome-copied-files", gnome.as_bytes()),
+                1 => ("text/uri-list", uri_list.as_bytes()),
+                2 => ("application/x-kde-cutselection", kde_cut.as_bytes()),
+                _ => ("UTF8_STRING", text.as_bytes()),
+            };
+            selection.set(&gtk::gdk::Atom::intern(name), 8, data);
+        },
+    );
+    ui.status.set_text(&if !ok {
+        "could not reach the clipboard".to_string()
+    } else {
+        format!(
+            "{} {} {} — paste in a file manager",
+            if cut { "cut" } else { "copied" },
+            paths.len(),
+            if paths.len() == 1 { "file" } else { "files" }
+        )
+    });
+}
+
+/// Deletes for good, with no trash to fall back on, so it asks first and says
+/// plainly what is about to go.
+fn delete_selected(ui: &Rc<Ui>) {
+    let paths = selected_paths(ui);
+    if paths.is_empty() {
+        return;
+    }
+    let folders = paths.iter().filter(|p| p.is_dir()).count();
+    let what = match (paths.len(), folders) {
+        (1, 0) => format!("Permanently delete “{}”?", name_of(&paths[0])),
+        (1, _) => format!(
+            "Permanently delete the folder “{}” and everything in it?",
+            name_of(&paths[0])
+        ),
+        (n, 0) => format!("Permanently delete {} files?", n),
+        (n, f) => format!(
+            "Permanently delete {} items, including {} folder{} and everything in {}?",
+            n,
+            f,
+            if f == 1 { "" } else { "s" },
+            if f == 1 { "it" } else { "them" }
+        ),
+    };
+    let dialog = MessageDialog::new(
+        Some(&ui.window),
+        DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
+        MessageType::Warning,
+        ButtonsType::YesNo,
+        &what,
+    );
+    dialog.set_secondary_text(Some("This cannot be undone."));
+    let ui = ui.clone();
+    dialog.connect_response(move |d, resp| {
+        d.close();
+        if resp == ResponseType::Yes {
+            remove_selected(&ui, true);
+        }
+    });
+    dialog.show_all();
+}
+
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .unwrap_or(p.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Opens the file manager's own Properties dialog (Dolphin on KDE, Nautilus
@@ -841,9 +1081,17 @@ fn open_with(ui: &Ui) {
 /// is asynchronous with no timeout; only a real failure, such as no file
 /// manager providing the interface, is reported.
 fn show_properties(ui: &Rc<Ui>) {
-    let Some(p) = selected_path(ui) else { return };
-    // gio percent-encodes the URI, so names with spaces or '#' survive.
-    let uri = gio::File::for_path(&p).uri().to_string();
+    let paths = selected_paths(ui);
+    if paths.is_empty() {
+        return;
+    }
+    // gio percent-encodes the URI, so names with spaces or '#' survive. The
+    // interface takes a list, so a multiple selection opens one dialog per
+    // file, or a combined one, as the file manager sees fit.
+    let uris: Vec<String> = paths
+        .iter()
+        .map(|p| gio::File::for_path(p).uri().to_string())
+        .collect();
     let conn = match gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) {
         Ok(c) => c,
         Err(e) => {
@@ -858,7 +1106,7 @@ fn show_properties(ui: &Rc<Ui>) {
         "/org/freedesktop/FileManager1",
         "org.freedesktop.FileManager1",
         "ShowItemProperties",
-        Some(&(vec![uri], "").to_variant()),
+        Some(&(uris, "").to_variant()),
         None,
         gio::DBusCallFlags::NONE,
         i32::MAX, // G_MAXINT: no timeout
@@ -875,22 +1123,58 @@ fn show_properties(ui: &Rc<Ui>) {
 /// Moves the selected file to the desktop trash (recoverable), and drops the
 /// row. The daemon sees the move through fanotify on its own.
 fn trash_selected(ui: &Ui) {
-    let Some((_, iter)) = ui.tree.selection().selected() else {
-        return;
-    };
-    let Some(path) = path_at(ui, &iter) else {
-        return;
-    };
-    match gio::File::for_path(&path).trash(None::<&gio::Cancellable>) {
-        Ok(()) => {
-            ui.store.remove(&iter);
-            ui.status
-                .set_text(&format!("moved to trash: {}", path.display()));
+    remove_selected(ui, false);
+}
+
+/// Moves the selected files to the desktop trash (recoverable), or deletes
+/// them outright, and drops their rows. The daemon sees the change through
+/// fanotify on its own.
+fn remove_selected(ui: &Ui, permanent: bool) {
+    // Row references survive the removals: a plain path would point at the
+    // wrong row as soon as an earlier one is gone.
+    let refs: Vec<TreeRowReference> = ui
+        .tree
+        .selection()
+        .selected_rows()
+        .0
+        .iter()
+        .filter_map(|p| TreeRowReference::new(&ui.store, p))
+        .collect();
+    let (mut done, mut last, mut failure) = (0usize, None, None);
+    for r in refs {
+        let Some(iter) = r.path().and_then(|p| ui.store.iter(&p)) else {
+            continue;
+        };
+        let Some(path) = path_at(ui, &iter) else { continue };
+        let result = if !permanent {
+            gio::File::for_path(&path)
+                .trash(None::<&gio::Cancellable>)
+                .map_err(|e| e.message().to_string())
+        } else if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(()) => {
+                ui.store.remove(&iter);
+                done += 1;
+                last = Some(path);
+            }
+            Err(e) => failure = Some(e),
         }
-        Err(e) => ui
-            .status
-            .set_text(&format!("could not move to trash: {}", e.message())),
     }
+    let verb = if permanent { "deleted" } else { "moved to trash" };
+    // One failure is worth reporting even when the rest went.
+    ui.status.set_text(&match (done, failure) {
+        (0, Some(e)) => format!("could not delete: {}", e),
+        (n, Some(e)) => format!("{} {}; one failed: {}", verb, n, e),
+        (1, None) => match last {
+            Some(p) => format!("{}: {}", verb, p.display()),
+            None => String::new(),
+        },
+        (n, None) => format!("{} {} files", verb, n),
+    });
 }
 
 fn open(target: &Path) {

@@ -80,6 +80,13 @@ Click a column heading to sort by name, folder, size or date. Right-click a
 result to open it with another application, show the folder it is in, copy its
 name or path, move it to the trash, or open its properties.
 
+Several results at once: click one, then Shift-click another for everything in
+between, or Ctrl-click to pick them out one by one. Every action then applies
+to all of them. With the list in focus, Ctrl+C copies the files themselves, so
+a file manager can paste them; Ctrl+X cuts them; Delete moves them to the
+trash, and Shift+Delete deletes them for good, after asking. Copy Path and Copy
+Name still copy text, one file per line.
+
 Preferences (Ctrl+P) has the rest: search as you type, hidden files, and how
 many results to show.
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Window
+
+* Shift-click and Ctrl-click select several results at once, and every action —
+  open, open with, containing folder, copy, trash, properties — applies to the
+  whole selection. Opening more than ten files at once asks first.
+* Ctrl+C and Ctrl+X put the files themselves on the clipboard, for a file
+  manager to paste as a copy or a move.
+* Delete moves the selection to the trash; Shift+Delete deletes it for good,
+  after a warning that names what is going.
+
 ## 0.1.0 — 2026-09-14
 
 First public release.
