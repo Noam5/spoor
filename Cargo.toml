@@ -1,6 +1,6 @@
 [package]
 name = "spoor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Noam <noam555@gmail.com>"]
 repository = "https://github.com/Noam5/spoor"

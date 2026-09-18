@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-09-18
 
 ### Command line
 
@@ -18,6 +18,12 @@
   manager to paste as a copy or a move.
 * Delete moves the selection to the trash; Shift+Delete deletes it for good,
   after a warning that names what is going.
+
+### Documentation
+
+* A benchmark anyone can run (`bench/`), measuring spoor against plocate,
+  FSearch, find, fd and bfs, and the cost of watching a disk with fanotify,
+  inotify or eBPF. The README leads with the result.
 
 ## 0.1.0 — 2026-09-14
 
