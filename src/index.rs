@@ -1294,6 +1294,8 @@ pub struct GraftStats {
     pub total: usize,
     pub added: usize,
     pub removed: usize,
+    /// Entries kept from before because the walk could not read their folder.
+    pub kept: usize,
 }
 
 impl Index {
@@ -1327,11 +1329,21 @@ impl Index {
     /// (parent, name, is_dir): parent indexes an earlier element, or is
     /// NO_PARENT for the mount's own children.
     ///
+    /// `incomplete` names the walked folders (NO_PARENT for the mount itself)
+    /// whose contents could not be fully read. Whatever the index held under
+    /// them that the walk did not see is kept, not treated as deleted; a
+    /// subfolder the walk did read is still authoritative for its own subtree.
+    ///
     /// Entries still present are revived in place rather than re-created, so
     /// repeated rescans do not grow the arena; vanished ones just stay dead.
     /// `remove()` is deliberately not used: it prunes `dir_ino` per directory,
     /// which is quadratic across 26k directories.
-    pub fn graft<N: AsRef<[u8]>>(&mut self, mount: u32, walked: &[(u32, N, bool)]) -> GraftStats {
+    pub fn graft<N: AsRef<[u8]>>(
+        &mut self,
+        mount: u32,
+        walked: &[(u32, N, bool)],
+        incomplete: &[u32],
+    ) -> GraftStats {
         let mut was_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut stack: Vec<u32> = self.children.get(&mount).cloned().unwrap_or_default();
         while let Some(id) = stack.pop() {
@@ -1387,12 +1399,63 @@ impl Index {
             };
             ids.push(id);
         }
+
+        // Children of an unreadable folder that the walk missed come back with
+        // everything that was under them.
+        let mut kept = 0usize;
+        let mut stack: Vec<u32> = Vec::new();
+        for &local in incomplete {
+            let dir = if local == NO_PARENT {
+                mount
+            } else {
+                ids[local as usize]
+            };
+            if let Some(kids) = self.children.get(&dir) {
+                stack.extend(
+                    kids.iter()
+                        .copied()
+                        .filter(|&k| !self.entries[k as usize].alive && was_alive.contains(&k)),
+                );
+            }
+            while let Some(id) = stack.pop() {
+                self.entries[id as usize].alive = true;
+                kept += 1;
+                if let Some(kids) = self.children.get(&id) {
+                    stack.extend(kids.iter().copied().filter(|&k| was_alive.contains(&k)));
+                }
+            }
+        }
+
         self.entries[mount as usize].alive = true;
         GraftStats {
-            total: walked.len(),
+            total: walked.len() + kept,
             added,
-            removed: was_alive.len() - unchanged,
+            removed: was_alive.len() - unchanged - kept,
+            kept,
         }
+    }
+
+    /// What is alive under `mount`, in the pre-order form `graft` takes: the
+    /// listing to replay after a walk that had to keep part of it.
+    pub fn listing(&self, mount: u32) -> Vec<(u32, Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(u32, u32)> = self
+            .children
+            .get(&mount)
+            .map(|v| v.iter().rev().map(|&k| (NO_PARENT, k)).collect())
+            .unwrap_or_default();
+        while let Some((parent_local, id)) = stack.pop() {
+            let e = &self.entries[id as usize];
+            if !e.alive {
+                continue;
+            }
+            let local = out.len() as u32;
+            out.push((parent_local, e.name.to_vec(), e.is_dir));
+            if let Some(kids) = self.children.get(&id) {
+                stack.extend(kids.iter().rev().map(|&k| (local, k)));
+            }
+        }
+        out
     }
 }
 
@@ -1883,6 +1946,7 @@ mod tests {
                 (0, "IMG-2.jpg", false),
                 (NO_PARENT, "notes.txt", false),
             ]),
+            &[],
         );
         assert_eq!((s1.total, s1.added, s1.removed), (4, 4, 0));
         assert_eq!(ix.search("IMG-", 10).len(), 2);
@@ -1897,6 +1961,7 @@ mod tests {
                 (0, "IMG-3.jpg", false),
                 (NO_PARENT, "notes.txt", false),
             ]),
+            &[],
         );
         assert_eq!((s2.total, s2.added, s2.removed), (4, 1, 1));
         let mut hits = ix.search("IMG-", 10);
@@ -1917,10 +1982,82 @@ mod tests {
         assert_eq!(ix.search("/home/alice/GoogleDrive/photos/", 10).len(), 2);
 
         // an empty listing empties the subtree but keeps the mount point
-        let s3 = ix.graft::<String>(drive, &[]);
+        let s3 = ix.graft::<String>(drive, &[], &[]);
         assert_eq!(s3.removed, 4);
         assert_eq!(ix.search("IMG-", 10).len(), 0);
         assert_eq!(ix.search("GoogleDrive", 10).len(), 1);
+    }
+
+    #[test]
+    fn graft_keeps_what_an_unreadable_folder_held() {
+        let mut ix = tree();
+        ix.build_trigrams();
+        let root = ix.root_id();
+        let alice = ix.find_child(root, "alice").unwrap();
+        let drive = ix.add(alice, "GoogleDrive", true, 60);
+        let w = |v: &[(u32, &str, bool)]| -> Vec<(u32, String, bool)> {
+            v.iter().map(|(p, n, d)| (*p, n.to_string(), *d)).collect()
+        };
+        let full = w(&[
+            (NO_PARENT, "Family", true),
+            (0, "tree.pdf", false),
+            (0, "Letters", true),
+            (2, "1952.jpg", false),
+            (0, "Scans", true),
+            (4, "old.jpg", false),
+            (NO_PARENT, "notes.txt", false),
+        ]);
+        ix.graft(drive, &full, &[]);
+
+        // Family could not be listed: the walk saw nothing inside it, yet its
+        // contents stay. notes.txt was deleted and goes; new.txt arrives.
+        let s = ix.graft(
+            drive,
+            &w(&[(NO_PARENT, "Family", true), (NO_PARENT, "new.txt", false)]),
+            &[0],
+        );
+        assert_eq!((s.total, s.added, s.removed, s.kept), (7, 1, 1, 5));
+        assert_eq!(ix.search("1952", 10).len(), 1);
+        assert_eq!(ix.search("tree.pdf", 10).len(), 1);
+        assert_eq!(ix.search("notes.txt", 10).len(), 0);
+        assert_eq!(ix.search("new.txt", 10).len(), 1);
+
+        // Family listed only in part (Letters and a new file), so Scans is kept
+        // -- but Letters was read, so what vanished from it is gone.
+        let s = ix.graft(
+            drive,
+            &w(&[
+                (NO_PARENT, "Family", true),
+                (0, "Letters", true),
+                (0, "added.pdf", false),
+                (NO_PARENT, "new.txt", false),
+            ]),
+            &[0],
+        );
+        assert_eq!((s.added, s.removed), (1, 1)); // added.pdf; 1952.jpg
+        assert_eq!(ix.search("1952", 10).len(), 0);
+        assert_eq!(ix.search("old.jpg", 10).len(), 1);
+        assert_eq!(ix.search("tree.pdf", 10).len(), 1);
+
+        // the mount itself unreadable part-way: its unseen children stay
+        let s = ix.graft(drive, &w(&[(NO_PARENT, "new.txt", false)]), &[NO_PARENT]);
+        assert_eq!(s.removed, 0);
+        assert_eq!(ix.search("old.jpg", 10).len(), 1);
+
+        // the export replays onto an empty tree as the same thing
+        let mut hits = ix.search("GoogleDrive/", 20);
+        hits.sort();
+        let listing = ix.listing(drive);
+        assert_eq!(listing.len(), hits.len());
+        let mut fresh = tree();
+        fresh.build_trigrams();
+        let froot = fresh.root_id();
+        let falice = fresh.find_child(froot, "alice").unwrap();
+        let fdrive = fresh.add(falice, "GoogleDrive", true, 60);
+        fresh.graft(fdrive, &listing, &[]);
+        let mut again = fresh.search("GoogleDrive/", 20);
+        again.sort();
+        assert_eq!(again, hits);
     }
 
     fn latin1_tree(built: bool) -> Index {

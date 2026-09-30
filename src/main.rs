@@ -523,7 +523,7 @@ fn walk_part(p: &Part, exclude: &Exclude) -> (Index, scan::ScanStats, std::time:
     let st = scan::scan(&mut fresh, &p.root, exclude);
     for (path, list) in p.listings.lock().unwrap().iter() {
         if let Some(mount) = fresh.resolve_path(path) {
-            fresh.graft(mount, list);
+            fresh.graft(mount, list, &[]);
         }
     }
     fresh.build_trigrams();
@@ -629,7 +629,7 @@ fn rescan_loop(cat: Arc<Catalog>, paths: Vec<String>, interval: u64) {
                         p, why, RETRY
                     );
                 }
-                scan::ForeignWalk::Listed(list, errors) => {
+                scan::ForeignWalk::Listed(list, incomplete) => {
                     let walk_s = t0.elapsed().as_secs_f64();
                     let t1 = Instant::now();
                     let Some(part) = cat.part_for(p) else {
@@ -644,7 +644,15 @@ fn rescan_loop(cat: Arc<Catalog>, paths: Vec<String>, interval: u64) {
                             eprintln!("spoor: rescan {}: not in the index (excluded?)", p);
                         }
                         Some(mount) => {
-                            let st = ix.graft(mount, &list);
+                            let st = ix.graft(mount, &list, &incomplete);
+                            // The reconciliation replays this listing onto an
+                            // index that has nothing to keep, so it must hold
+                            // what was kept, not the walk's holes.
+                            let list = if incomplete.is_empty() {
+                                list
+                            } else {
+                                ix.listing(mount)
+                            };
                             drop(ix);
                             part.listings.lock().unwrap().insert(p.clone(), list);
                             eprintln!(
@@ -655,10 +663,14 @@ fn rescan_loop(cat: Arc<Catalog>, paths: Vec<String>, interval: u64) {
                                 st.removed,
                                 walk_s,
                                 t1.elapsed().as_secs_f64() * 1000.0,
-                                if errors > 0 {
-                                    format!(", {} unreadable", errors)
-                                } else {
+                                if incomplete.is_empty() {
                                     String::new()
+                                } else {
+                                    format!(
+                                        ", {} unreadable folders kept as they were ({} entries)",
+                                        incomplete.len(),
+                                        st.kept
+                                    )
                                 }
                             );
                         }

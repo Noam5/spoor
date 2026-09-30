@@ -153,8 +153,11 @@ pub fn scan_subtree(index: &mut Index, parent_id: u32, path: &Path, depth: u32, 
 /// Outcome of walking a mount that fanotify cannot watch.
 pub enum ForeignWalk {
     /// Pre-order (parent, name, is_dir); parent indexes an earlier element, or
-    /// is NO_PARENT for the mount's own children. Plus the unreadable count.
-    Listed(Vec<(u32, Vec<u8>, bool)>, usize),
+    /// is NO_PARENT for the mount's own children. Plus the folders whose
+    /// contents could not be fully read, as indexes into the list (NO_PARENT
+    /// for the mount itself), sorted: what the index has under them is still
+    /// the best it knows.
+    Listed(Vec<(u32, Vec<u8>, bool)>, Vec<u32>),
     /// Not currently a readable mount. The caller keeps what it already has.
     Unavailable(String),
 }
@@ -193,7 +196,9 @@ pub fn walk_foreign(path: &str, exclude: &Exclude) -> ForeignWalk {
     let mut last_report = started;
 
     let mut out: Vec<(u32, Vec<u8>, bool)> = Vec::new();
-    let mut errors = 0usize;
+    // A listing that fails part-way -- Drive's per-minute quota answers 403 --
+    // says nothing about what the folder holds, so it must not read as empty.
+    let mut incomplete: Vec<u32> = Vec::new();
     let mut stack: Vec<(u32, PathBuf)> = vec![(NO_PARENT, PathBuf::from(path))];
     let mut first = true;
     while let Some((parent_idx, dir)) = stack.pop() {
@@ -212,18 +217,18 @@ pub fn walk_foreign(path: &str, exclude: &Exclude) -> ForeignWalk {
             Ok(rd) => rd,
             Err(e) if first => return ForeignWalk::Unavailable(e.to_string()),
             Err(_) => {
-                errors += 1;
+                incomplete.push(parent_idx);
                 continue;
             }
         };
         first = false;
         for entry in rd {
             let Ok(entry) = entry else {
-                errors += 1;
+                incomplete.push(parent_idx);
                 continue;
             };
             let Ok(ft) = entry.file_type() else {
-                errors += 1;
+                incomplete.push(parent_idx);
                 continue;
             };
             let name = entry.file_name();
@@ -239,12 +244,14 @@ pub fn walk_foreign(path: &str, exclude: &Exclude) -> ForeignWalk {
                 match fs::symlink_metadata(&child) {
                     Ok(m) if m.dev() == dev => stack.push((idx, child)),
                     Ok(_) => {}
-                    Err(_) => errors += 1,
+                    Err(_) => incomplete.push(idx),
                 }
             }
         }
     }
-    ForeignWalk::Listed(out, errors)
+    incomplete.sort_unstable();
+    incomplete.dedup();
+    ForeignWalk::Listed(out, incomplete)
 }
 
 #[cfg(test)]
